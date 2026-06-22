@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,13 +15,49 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	lru "github.com/hashicorp/golang-lru/v2"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
 )
+
+type PriceEntry struct {
+	Current  float64
+	Previous float64
+}
+
+type PriceCache struct {
+	mu    sync.RWMutex
+	store map[string]PriceEntry
+}
+
+func (c *PriceCache) Load(symbol string) (PriceEntry, bool) {
+	c.mu.RLock()
+	val, ok := c.store[symbol]
+	c.mu.RUnlock()
+	return val, ok
+}
+
+func (c *PriceCache) Store(symbol string, newPrice float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	oldEntry, ok := c.store[symbol]
+	if !ok {
+		c.store[symbol] = PriceEntry{Current: newPrice, Previous: newPrice}
+		return
+	}
+
+	c.store[symbol] = PriceEntry{
+		Current:  newPrice,
+		Previous: oldEntry.Current,
+	}
+}
 
 type App struct {
 	db         *sql.DB
 	bot        *tgbotapi.BotAPI
+	priceCache *PriceCache
+	langCache  *lru.Cache[int64, string]
 	kyivLoc    *time.Location
 	httpClient *http.Client
 }
@@ -57,6 +94,7 @@ var messages = map[string]map[string]string{
 		"updated":      "🕒 *Оновлено о %s (Київ)*",
 		"alert_hdr":    "🕒 *Планове оновлення (%s)*",
 		"dynamics":     "Динаміка зафіксована",
+		"no_data":      "немає даних",
 		"unit_m":       "хв",
 		"unit_h":       "год",
 		"btn_upd":      "🔄 Оновити",
@@ -73,6 +111,7 @@ var messages = map[string]map[string]string{
 		"updated":      "🕒 *Updated at %s (Kyiv)*",
 		"alert_hdr":    "🕒 *Scheduled update (%s)*",
 		"dynamics":     "Dynamics fixed",
+		"no_data":      "no data available",
 		"unit_m":       "min",
 		"unit_h":       "h",
 		"btn_upd":      "🔄 Update",
@@ -89,6 +128,7 @@ var messages = map[string]map[string]string{
 		"updated":      "🕒 *Обновлено в %s (Киев)*",
 		"alert_hdr":    "🕒 *Плановое обеспечение (%s)*",
 		"dynamics":     "Динамика зафиксирована",
+		"no_data":      "нет данных",
 		"unit_m":       "мин",
 		"unit_h":       "ч",
 		"btn_upd":      "🔄 Обновить",
@@ -142,106 +182,186 @@ var langKeyboard = tgbotapi.NewInlineKeyboardMarkup(
 	),
 )
 
-func (a *App) getAllPricesFormatted(ctx context.Context) string {
+func (a *App) startPriceTicker(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	log.Println("[Prices] Background price ticker started")
+	a.fetchAndCachePrices(ctx)
+
+	for {
+		select {
+		case <-ticker.C:
+			a.fetchAndCachePrices(ctx)
+		case <-ctx.Done():
+			log.Println("[Prices] Background price ticker stopped")
+			return
+		}
+	}
+}
+
+func (a *App) fetchAndCachePrices(ctx context.Context) {
 	var wg sync.WaitGroup
-	results := make([]string, len(trackedCoins))
-
-	for i, coin := range trackedCoins {
+	for _, coin := range trackedCoins {
 		wg.Add(1)
-		go func(idx int, c struct{ Symbol, Label string }) {
+		go func(c struct{ Symbol, Label string }) {
 			defer wg.Done()
-			url := fmt.Sprintf("https://api.binance.com/api/v3/ticker/price?symbol=%s", c.Symbol)
 
-			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+			url := fmt.Sprintf("https://api.binance.com/api/v3/ticker/price?symbol=%s", c.Symbol)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			if err != nil {
-				results[idx] = fmt.Sprintf("⚪️ %s: err", c.Label)
+				log.Printf("[Prices] Failed to create request for %s: %v", c.Symbol, err)
 				return
 			}
 
 			resp, err := a.httpClient.Do(req)
 			if err != nil {
-				results[idx] = fmt.Sprintf("⚪️ %s: err", c.Label)
+				log.Printf("[Prices] Binance request failed for %s: %v", c.Symbol, err)
 				return
 			}
 			defer resp.Body.Close()
 
-			var data struct {
-				Price string `json:"price"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-				results[idx] = fmt.Sprintf("⚪️ %s: err", c.Label)
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("[Prices] Binance returned status %d for %s", resp.StatusCode, c.Symbol)
 				return
 			}
 
-			currentPrice, _ := strconv.ParseFloat(data.Price, 64)
-
-			var lastPrice float64
-			_ = a.db.QueryRowContext(ctx, "SELECT price FROM market_prices WHERE symbol = $1", c.Symbol).
-				Scan(&lastPrice)
-
-			emoji := "⚪️"
-			trend := "0.00%"
-			if lastPrice > 0 {
-				diff := ((currentPrice - lastPrice) / lastPrice) * 100
-				if diff > 0.01 {
-					emoji = "🟢"
-					trend = fmt.Sprintf("+%.2f%%", diff)
-				} else if diff < -0.01 {
-					emoji = "🔴"
-					trend = fmt.Sprintf("%.2f%%", diff)
-				}
+			var data struct {
+				Price string `json:"price"`
+			}
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 102400)).Decode(&data); err != nil {
+				log.Printf("[Prices] Failed to decode Binance response for %s: %v", c.Symbol, err)
+				return
 			}
 
-			_, _ = a.db.ExecContext(ctx, `INSERT INTO market_prices (symbol, price) VALUES ($1, $2)
-				 ON CONFLICT (symbol) DO UPDATE SET price = EXCLUDED.price`, c.Symbol, currentPrice)
-
-			if c.Symbol == "USDTUAH" {
-				results[idx] = fmt.Sprintf(
-					"%s %s: *₴%.2f* (%s)",
-					emoji,
-					c.Label,
-					currentPrice,
-					trend,
-				)
-			} else {
-				results[idx] = fmt.Sprintf("%s %s: *$%.2f* (%s)", emoji, c.Label, currentPrice, trend)
+			price, err := strconv.ParseFloat(data.Price, 64)
+			if err != nil {
+				log.Printf("[Prices] Failed to parse Binance price for %s: %v", c.Symbol, err)
+				return
 			}
-		}(i, coin)
+
+			a.priceCache.Store(c.Symbol, price)
+
+			dbCtx, dbCancel := context.WithTimeout(ctx, 2*time.Second)
+			_, err = a.db.ExecContext(
+				dbCtx,
+				`INSERT INTO market_prices (symbol, price) VALUES ($1, $2)
+				 ON CONFLICT (symbol) DO UPDATE SET price = EXCLUDED.price`,
+				c.Symbol,
+				price,
+			)
+			dbCancel()
+			if err != nil {
+				log.Printf("[Prices] Failed to persist %s: %v", c.Symbol, err)
+			}
+		}(coin)
 	}
-
 	wg.Wait()
+}
+
+func (a *App) getFormattedPricesFromCache(lang string) string {
+	results := make([]string, len(trackedCoins))
+	for idx, coin := range trackedCoins {
+		entry, ok := a.priceCache.Load(coin.Symbol)
+		if !ok {
+			results[idx] = fmt.Sprintf("⚪️ %s: %s", coin.Label, getMsgText(lang, "no_data"))
+			continue
+		}
+
+		emoji := "⚪️"
+		percentChange := 0.0
+		if entry.Previous > 0 {
+			percentChange = ((entry.Current - entry.Previous) / entry.Previous) * 100
+		}
+		if percentChange > 0.001 {
+			emoji = "🟢"
+		} else if percentChange < -0.001 {
+			emoji = "🔴"
+		}
+
+		trend := fmt.Sprintf("%.2f%%", percentChange)
+		if percentChange > 0 {
+			trend = fmt.Sprintf("+%.2f%%", percentChange)
+		}
+		if coin.Symbol == "USDTUAH" {
+			results[idx] = fmt.Sprintf("%s %s: *₴%.2f* (`%s`)", emoji, coin.Label, entry.Current, trend)
+		} else {
+			results[idx] = fmt.Sprintf("%s %s: *$%.2f* (`%s`)", emoji, coin.Label, entry.Current, trend)
+		}
+	}
 	return strings.Join(results, "\n")
 }
 
-func (a *App) initDB() {
+func (a *App) initDB(ctx context.Context) {
 	var err error
-	a.db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	a.db, err = sql.Open("pgx", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	a.db.SetMaxOpenConns(25)
 	a.db.SetMaxIdleConns(25)
+	a.db.SetConnMaxLifetime(5 * time.Minute)
+	a.db.SetConnMaxIdleTime(5 * time.Minute)
 
-	_, _ = a.db.Exec(`CREATE TABLE IF NOT EXISTS subscribers (
-		chat_id BIGINT PRIMARY KEY,
-		interval_minutes INT DEFAULT 60,
-		last_sent TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-		language_code TEXT DEFAULT 'ua',
-		is_subscribed BOOLEAN DEFAULT FALSE
-	);`)
-	_, _ = a.db.Exec(
-		`CREATE TABLE IF NOT EXISTS market_prices (symbol TEXT PRIMARY KEY, price DOUBLE PRECISION);`,
-	)
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := a.db.PingContext(pingCtx); err != nil {
+		log.Fatal("database unreachable: ", err)
+	}
 }
 
-func (a *App) getLang(chatID int64) string {
+func (a *App) getLang(ctx context.Context, chatID int64) string {
+	if lang, ok := a.langCache.Get(chatID); ok {
+		return lang
+	}
+
 	var lang string
-	err := a.db.QueryRow("SELECT language_code FROM subscribers WHERE chat_id = $1", chatID).
+	err := a.db.QueryRowContext(ctx, "SELECT language_code FROM subscribers WHERE chat_id = $1", chatID).
 		Scan(&lang)
 	if err != nil {
 		return "ua"
 	}
+	a.langCache.Add(chatID, lang)
 	return lang
+}
+
+func (a *App) WarmupCache(ctx context.Context) {
+	pricesCtx, pricesCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer pricesCancel()
+
+	rows, err := a.db.QueryContext(pricesCtx, "SELECT symbol, price FROM market_prices")
+	if err != nil {
+		log.Printf("[Cache] Failed to warm up prices: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var symbol string
+		var price float64
+		if err := rows.Scan(&symbol, &price); err != nil {
+			log.Printf("[Cache] Failed to scan price: %v", err)
+			continue
+		}
+		a.priceCache.Store(symbol, price)
+	}
+
+	langsCtx, langsCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer langsCancel()
+	subRows, err := a.db.QueryContext(langsCtx, "SELECT chat_id, language_code FROM subscribers")
+	if err != nil {
+		log.Printf("[Cache] Failed to warm up languages: %v", err)
+		return
+	}
+	defer subRows.Close()
+
+	for subRows.Next() {
+		var chatID int64
+		var lang string
+		if err := subRows.Scan(&chatID, &lang); err == nil {
+			a.langCache.Add(chatID, lang)
+		}
+	}
 }
 
 // --- ПУЛ ВОРКЕРОВ ДЛЯ КРОНА ---
@@ -273,7 +393,6 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	log.Println("[Cron] Получен запрос от планировщика. Запуск рассылки...")
 	ctx := r.Context()
 
-	pricesText := a.getAllPricesFormatted(ctx)
 	currentTime := time.Now().In(a.kyivLoc).Format("15:04")
 
 	rows, err := a.db.QueryContext(ctx, `SELECT chat_id, language_code FROM subscribers
@@ -301,7 +420,7 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 			text := fmt.Sprintf(
 				getMsgText(lang, "alert_hdr")+"\n\n%s\n\n_%s_",
 				currentTime,
-				pricesText,
+				a.getFormattedPricesFromCache(lang),
 				getMsgText(lang, "dynamics"),
 			)
 
@@ -348,7 +467,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 			return
 		}
 
-		lang := a.getLang(chatID)
+		lang := a.getLang(context.Background(), chatID)
 
 		if strings.HasPrefix(data, "int_") {
 			minutes, _ := strconv.Atoi(data[4:])
@@ -374,7 +493,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 		}
 
 		if data == "refresh_price" {
-			prices := a.getAllPricesFormatted(context.Background())
+			prices := a.getFormattedPricesFromCache(lang)
 			t := time.Now().In(a.kyivLoc).Format("15:04:05")
 			text := fmt.Sprintf(
 				getMsgText(lang, "updated")+"\n\n%s\n\n_%s_",
@@ -399,7 +518,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 		return
 	}
 	chatID := update.Message.Chat.ID
-	lang := a.getLang(chatID)
+	lang := a.getLang(context.Background(), chatID)
 
 	switch update.Message.Command() {
 	case "start":
@@ -426,7 +545,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 		msg.ReplyMarkup = getIntervalKeyboard(lang)
 		_, _ = a.bot.Send(msg)
 	case "price":
-		prices := a.getAllPricesFormatted(context.Background())
+		prices := a.getFormattedPricesFromCache(lang)
 		text := fmt.Sprintf(getMsgText(lang, "price_hdr")+"\n\n%s", prices)
 		msg := tgbotapi.NewMessage(chatID, text)
 		msg.ParseMode = "Markdown"
@@ -442,7 +561,15 @@ func main() {
 		kyivLoc:    time.FixedZone("Kyiv", 2*60*60),
 		httpClient: &http.Client{Timeout: 4 * time.Second},
 	}
-	app.initDB()
+	cache, err := lru.New[int64, string](50000)
+	if err != nil {
+		log.Fatal(err)
+	}
+	app.priceCache = &PriceCache{store: make(map[string]PriceEntry)}
+	app.langCache = cache
+	app.initDB(context.Background())
+	app.WarmupCache(context.Background())
+	go app.startPriceTicker(context.Background())
 
 	botToken := os.Getenv("TELEGRAM_APITOKEN")
 	if botToken == "" {
