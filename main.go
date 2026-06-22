@@ -24,6 +24,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/joho/godotenv"
+	"golang.org/x/time/rate"
 )
 
 
@@ -547,6 +548,25 @@ func (a *App) updateWorker(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
+
+func (a *App) rateLimitMiddleware(limiter *rate.Limiter, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			slog.Warn(
+				"rate limit exceeded, dropping request",
+				"endpoint",
+				r.URL.Path,
+				"remote_ip",
+				r.RemoteAddr,
+			)
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("Too Many Requests"))
+			return
+		}
+		next(w, r)
+	}
+}
+
 func safeSecretCompare(inputToken, expectedSecret string) bool {
 	if expectedSecret == "" {
 		return false
@@ -1011,6 +1031,9 @@ func main() {
 		go app.alertWorker(runCtx, &cronWG)
 	}
 
+	cronLimiter := rate.NewLimiter(rate.Every(30*time.Second), 5)
+	webhookLimiter := rate.NewLimiter(rate.Limit(50), 100)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1030,8 +1053,8 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Ready"))
 	})
-	mux.HandleFunc("/cron", app.handleCron)
-	mux.HandleFunc("/webhook", app.handleWebhook)
+	mux.HandleFunc("/cron", app.rateLimitMiddleware(cronLimiter, app.handleCron))
+	mux.HandleFunc("/webhook", app.rateLimitMiddleware(webhookLimiter, app.handleWebhook))
 
 	port := os.Getenv("PORT")
 	if port == "" {
