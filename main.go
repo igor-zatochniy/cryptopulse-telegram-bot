@@ -65,11 +65,35 @@ func (c *PriceCache) Store(symbol string, newPrice float64) {
 	}
 }
 
+type SafeIDCollector struct {
+	mu  sync.Mutex
+	ids []int64
+}
+
+func (c *SafeIDCollector) Add(id int64) {
+	c.mu.Lock()
+	c.ids = append(c.ids, id)
+	c.mu.Unlock()
+}
+
+func (c *SafeIDCollector) FlushIDs() []int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.ids) == 0 {
+		return nil
+	}
+	result := make([]int64, len(c.ids))
+	copy(result, c.ids)
+	c.ids = nil
+	return result
+}
+
 type Job struct {
-	ChatID   int64
-	Lang     string
-	Text     string
-	DoneFunc func()
+	ChatID    int64
+	Lang      string
+	Text      string
+	Collector *SafeIDCollector
+	DoneFunc  func()
 }
 
 
@@ -474,41 +498,34 @@ func (a *App) alertWorker(ctx context.Context, wg *sync.WaitGroup) {
 			if !ok {
 				return
 			}
-			func() {
-				defer job.DoneFunc()
+			msg := tgbotapi.NewMessage(job.ChatID, job.Text)
+			msg.ParseMode = "Markdown"
+			msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
 
-				msg := tgbotapi.NewMessage(job.ChatID, job.Text)
-				msg.ParseMode = "Markdown"
-				msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
-
-				if _, err := a.bot.Send(msg); err != nil {
-					slog.Error(
-						"failed to send scheduled alert telegram packet",
-						"chat_id",
-						job.ChatID,
-						"error",
-						err,
-					)
-					return
-				}
-
-				dbCtx, dbCancel := context.WithTimeout(ctx, 2*time.Second)
-				_, err := a.db.ExecContext(
-					dbCtx,
-					"UPDATE subscribers SET last_sent = NOW() WHERE chat_id = $1",
+			if _, err := a.bot.Send(msg); err != nil {
+				slog.Error(
+					"failed to send scheduled alert telegram packet",
+					"chat_id",
 					job.ChatID,
+					"error",
+					err,
 				)
-				dbCancel()
-				if err != nil {
-					slog.Error(
-						"failed to update last delivery timestamp",
-						"chat_id",
-						job.ChatID,
-						"error",
-						err,
-					)
+				if strings.Contains(err.Error(), "chat not found") ||
+					strings.Contains(err.Error(), "forbidden") {
+					go func(id int64) {
+						dbCtx, dbCancel := context.WithTimeout(context.Background(), 3*time.Second)
+						defer dbCancel()
+						_, _ = a.db.ExecContext(
+							dbCtx,
+							"UPDATE subscribers SET is_subscribed = FALSE WHERE chat_id = $1",
+							id,
+						)
+					}(job.ChatID)
 				}
-			}()
+			}
+
+			job.Collector.Add(job.ChatID)
+			job.DoneFunc()
 		case <-ctx.Done():
 			return
 		}
@@ -570,10 +587,21 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	currentTime := time.Now().In(a.kyivLoc).Format("15:04")
-	rows, err := a.db.QueryContext(ctx, `SELECT chat_id, language_code FROM subscribers
+	dbQueryCtx, dbQueryCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer dbQueryCancel()
+
+	tx, err := a.db.BeginTx(dbQueryCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		slog.Error("failed to initiate cron isolation transaction", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(dbQueryCtx, `SELECT chat_id, language_code FROM subscribers
                                WHERE is_subscribed = TRUE
                                AND last_sent <= NOW() - (interval_minutes * INTERVAL '1 minute') + INTERVAL '59 second'
-                               ORDER BY last_sent ASC`)
+                               FOR UPDATE SKIP LOCKED`)
 	if err != nil {
 		slog.Error("failed to fetch notification target chunk with pessimistic locks", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -602,6 +630,7 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	collector := &SafeIDCollector{ids: make([]int64, 0, len(subs))}
 	var dispatchWG sync.WaitGroup
 
 	for _, s := range subs {
@@ -616,10 +645,11 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 
 		dispatchWG.Add(1)
 		job := Job{
-			ChatID:   s.ID,
-			Lang:     s.Lang,
-			Text:     text,
-			DoneFunc: func() { dispatchWG.Done() },
+			ChatID:    s.ID,
+			Lang:      s.Lang,
+			Text:      text,
+			Collector: collector,
+			DoneFunc:  func() { dispatchWG.Done() },
 		}
 
 		select {
@@ -635,8 +665,54 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	dispatchWG.Wait()
-	slog.Info("all cron dispatch batch routines reported completion tasks successfully")
+	doneChan := make(chan struct{})
+	go func() {
+		dispatchWG.Wait()
+		close(doneChan)
+	}()
+
+	select {
+	case <-doneChan:
+		slog.Info("all cron dispatch batch routines reported completion tasks successfully")
+	case <-time.After(12 * time.Second):
+		slog.Error(
+			"cron worker tracking process hit execution pool barrier timeout limits, flushing partial results",
+		)
+
+		partialIDs := collector.FlushIDs()
+		if len(partialIDs) > 0 {
+			if _, dbErr := tx.ExecContext(dbQueryCtx, "UPDATE subscribers SET last_sent = NOW() WHERE chat_id = ANY($1)", any(partialIDs)); dbErr != nil {
+				slog.Error(
+					"failed to update partial success timestamps inside transaction",
+					"error",
+					dbErr,
+				)
+			} else if commitErr := tx.Commit(); commitErr != nil {
+				slog.Error("failed to commit partial cron sync transaction", "error", commitErr)
+			} else {
+				slog.Info("successfully saved state for partial successes on timeout checkpoint", "count", len(partialIDs))
+			}
+		}
+
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = w.Write([]byte("Cron execution pool barrier timeout hit. Partial data saved."))
+		return
+	}
+
+	currentIDs := collector.FlushIDs()
+	if len(currentIDs) > 0 {
+		if _, dbErr := tx.ExecContext(dbQueryCtx, "UPDATE subscribers SET last_sent = NOW() WHERE chat_id = ANY($1)", any(currentIDs)); dbErr != nil {
+			slog.Error("failed to update timestamps inside active transaction", "error", dbErr)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error("failed to commit cron sync block transaction", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("Cron processing completed"))
