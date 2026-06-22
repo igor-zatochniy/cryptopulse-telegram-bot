@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -54,12 +55,15 @@ func (c *PriceCache) Store(symbol string, newPrice float64) {
 }
 
 type App struct {
-	db         *sql.DB
-	bot        *tgbotapi.BotAPI
-	priceCache *PriceCache
-	langCache  *lru.Cache[int64, string]
-	kyivLoc    *time.Location
-	httpClient *http.Client
+	db                 *sql.DB
+	bot                *tgbotapi.BotAPI
+	priceCache         *PriceCache
+	langCache          *lru.Cache[int64, string]
+	telegramUpdateChan chan tgbotapi.Update
+	cronJobChan        chan Job
+	kyivLoc            *time.Location
+	httpClient         *http.Client
+	isCronRunning      atomic.Bool
 }
 
 var muMsg sync.RWMutex
@@ -76,9 +80,10 @@ var trackedCoins = []struct {
 }
 
 type Job struct {
-	ChatID int64
-	Lang   string
-	Text   string
+	ChatID   int64
+	Lang     string
+	Text     string
+	DoneFunc func()
 }
 
 var messages = map[string]map[string]string{
@@ -364,32 +369,51 @@ func (a *App) WarmupCache(ctx context.Context) {
 	}
 }
 
-// --- ПУЛ ВОРКЕРОВ ДЛЯ КРОНА ---
-func (a *App) alertWorker(baseCtx context.Context, jobs <-chan Job, wg *sync.WaitGroup) {
+func (a *App) alertWorker(baseCtx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	for job := range jobs {
-		msg := tgbotapi.NewMessage(job.ChatID, job.Text)
-		msg.ParseMode = "Markdown"
-		msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
-
-		if _, err := a.bot.Send(msg); err == nil {
-			dbCtx, dbCancel := context.WithTimeout(baseCtx, 2*time.Second)
-			_, dbErr := a.db.ExecContext(
-				dbCtx,
-				"UPDATE subscribers SET last_sent = NOW() WHERE chat_id = $1",
-				job.ChatID,
-			)
-			if dbErr != nil {
-				log.Printf("[DB Error] Не удалось обновить last_sent для %d: %v", job.ChatID, dbErr)
+	for job := range a.cronJobChan {
+		func() {
+			if job.DoneFunc != nil {
+				defer job.DoneFunc()
 			}
-			dbCancel()
-		} else {
-			log.Printf("Failed to send cron alert to %d: %v", job.ChatID, err)
-		}
+
+			msg := tgbotapi.NewMessage(job.ChatID, job.Text)
+			msg.ParseMode = "Markdown"
+			msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
+
+			if _, err := a.bot.Send(msg); err == nil {
+				dbCtx, dbCancel := context.WithTimeout(baseCtx, 2*time.Second)
+				_, dbErr := a.db.ExecContext(
+					dbCtx,
+					"UPDATE subscribers SET last_sent = NOW() WHERE chat_id = $1",
+					job.ChatID,
+				)
+				dbCancel()
+				if dbErr != nil {
+					log.Printf("[DB Error] Failed to update last_sent for %d: %v", job.ChatID, dbErr)
+				}
+			} else {
+				log.Printf("Failed to send cron alert to %d: %v", job.ChatID, err)
+			}
+		}()
+	}
+}
+
+func (a *App) updateWorker(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for update := range a.telegramUpdateChan {
+		a.processTelegramUpdate(update)
 	}
 }
 
 func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
+	if !a.isCronRunning.CompareAndSwap(false, true) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte("Cron execution already in progress"))
+		return
+	}
+	defer a.isCronRunning.Store(false)
+
 	log.Println("[Cron] Получен запрос от планировщика. Запуск рассылки...")
 	ctx := r.Context()
 
@@ -405,13 +429,7 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	jobs := make(chan Job, 500)
-	var workerWG sync.WaitGroup
-
-	for i := 1; i <= 5; i++ {
-		workerWG.Add(1)
-		go a.alertWorker(context.Background(), jobs, &workerWG)
-	}
+	var dispatchWG sync.WaitGroup
 
 	for rows.Next() {
 		var id int64
@@ -424,20 +442,27 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 				getMsgText(lang, "dynamics"),
 			)
 
-			sendCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-			select {
-			case jobs <- Job{ChatID: id, Lang: lang, Text: text}:
-			case <-sendCtx.Done():
+			dispatchWG.Add(1)
+			job := Job{
+				ChatID:   id,
+				Lang:     lang,
+				Text:     text,
+				DoneFunc: dispatchWG.Done,
 			}
-			cancel()
+			select {
+			case a.cronJobChan <- job:
+			case <-ctx.Done():
+				dispatchWG.Done()
+				dispatchWG.Wait()
+				return
+			}
 		}
 	}
 
-	close(jobs)
-	workerWG.Wait()
+	dispatchWG.Wait()
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Cron executed successfully"))
+	_, _ = w.Write([]byte("Cron executed successfully"))
 }
 
 func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -448,9 +473,14 @@ func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-
-	go a.processTelegramUpdate(update)
+	select {
+	case a.telegramUpdateChan <- update:
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	case <-time.After(1 * time.Second):
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("503 Service Unavailable: Internal buffer saturated"))
+	}
 }
 
 func (a *App) processTelegramUpdate(update tgbotapi.Update) {
@@ -558,8 +588,10 @@ func main() {
 	_ = godotenv.Load()
 
 	app := &App{
-		kyivLoc:    time.FixedZone("Kyiv", 2*60*60),
-		httpClient: &http.Client{Timeout: 4 * time.Second},
+		telegramUpdateChan: make(chan tgbotapi.Update, 1000),
+		cronJobChan:        make(chan Job, 5000),
+		kyivLoc:            time.FixedZone("Kyiv", 2*60*60),
+		httpClient:         &http.Client{Timeout: 4 * time.Second},
 	}
 	cache, err := lru.New[int64, string](50000)
 	if err != nil {
@@ -582,6 +614,18 @@ func main() {
 	}
 	app.bot = tgBot
 	log.Printf("[Success] Бот авторизован под именем: %s", app.bot.Self.UserName)
+
+	var updateWG sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		updateWG.Add(1)
+		go app.updateWorker(&updateWG)
+	}
+
+	var cronWG sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		cronWG.Add(1)
+		go app.alertWorker(context.Background(), &cronWG)
+	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
