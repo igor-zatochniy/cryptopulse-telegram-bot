@@ -2,24 +2,35 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	"log/slog"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	lru "github.com/hashicorp/golang-lru/v2"
-	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
 )
+
+
+type Subscriber struct {
+	ID   int64
+	Lang string
+}
 
 type PriceEntry struct {
 	Current  float64
@@ -54,6 +65,14 @@ func (c *PriceCache) Store(symbol string, newPrice float64) {
 	}
 }
 
+type Job struct {
+	ChatID   int64
+	Lang     string
+	Text     string
+	DoneFunc func()
+}
+
+
 type App struct {
 	db                 *sql.DB
 	bot                *tgbotapi.BotAPI
@@ -63,10 +82,10 @@ type App struct {
 	cronJobChan        chan Job
 	kyivLoc            *time.Location
 	httpClient         *http.Client
+	webhookSecret      string
+	cronSecret         string
 	isCronRunning      atomic.Bool
 }
-
-var muMsg sync.RWMutex
 
 var trackedCoins = []struct {
 	Symbol string
@@ -79,11 +98,10 @@ var trackedCoins = []struct {
 	{"USDTUAH", "USDT"},
 }
 
-type Job struct {
-	ChatID   int64
-	Lang     string
-	Text     string
-	DoneFunc func()
+var allowedLanguages = map[string]bool{
+	"ua": true,
+	"en": true,
+	"ru": true,
 }
 
 var messages = map[string]map[string]string{
@@ -98,11 +116,12 @@ var messages = map[string]map[string]string{
 		"lang_fixed":   "✅ Мову змінено на Українську!",
 		"updated":      "🕒 *Оновлено о %s (Київ)*",
 		"alert_hdr":    "🕒 *Планове оновлення (%s)*",
-		"dynamics":     "Динаміка зафіксована",
-		"no_data":      "немає даних",
+		"dynamics":     "Динаміка цін за останні 15с",
 		"unit_m":       "хв",
 		"unit_h":       "год",
 		"btn_upd":      "🔄 Оновити",
+		"db_err":       "❌ Виникла технічна помилка при збереженні даних. Будь ласка, спробуйте пізніше.",
+		"no_data":      "немає даних",
 	},
 	"en": {
 		"welcome":      "Welcome! 🖖 Your crypto assistant is online! ⚡️\n\n🔹 Live rates: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart alerts: Frequency (1 min – 24h).\n🔹 UAH market: USDT to UAH rate.\n\nPress **/subscribe** to start!",
@@ -115,14 +134,15 @@ var messages = map[string]map[string]string{
 		"lang_fixed":   "✅ Language changed to English!",
 		"updated":      "🕒 *Updated at %s (Kyiv)*",
 		"alert_hdr":    "🕒 *Scheduled update (%s)*",
-		"dynamics":     "Dynamics fixed",
-		"no_data":      "no data available",
+		"dynamics":     "Price dynamics (last 15s)",
 		"unit_m":       "min",
 		"unit_h":       "h",
 		"btn_upd":      "🔄 Update",
+		"db_err":       "❌ A technical error occurred while saving data. Please try again later.",
+		"no_data":      "no data available",
 	},
 	"ru": {
-		"welcome":      "Привет! 🖖 Твой крипто-ассистент уже на связи! ⚡️\n\n🔹 Live-курсы: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart-уведомления: Частота (1 мин – 24 ч).\n🔹 UAH-маркет: Курс USDT к гривне.\n\nЖми **/subscribe** для старта!",
+		"welcome":      "Привет! 🖖 Твой крипто-ассистент уже на связи! ⚡️\n\n🔹 Live-курсы: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart-уведомления: Частота (1 мин – 24 ч).\n🔹 UAH-маркет: Курс USDT к грывне.\n\nЖми **/subscribe** для старта!",
 		"subscribe":    "✅ Подписка активирована! Частота: 1 ч. Изменить: /interval",
 		"unsubscribe":  "❌ Вы отписались от рассылки. Настройки языка сохранены.",
 		"price_hdr":    "💰 *Актуальные курсы:*",
@@ -131,22 +151,62 @@ var messages = map[string]map[string]string{
 		"lang_sel":     "🌍 *Выберите язык:*",
 		"lang_fixed":   "✅ Язык изменен на Русский!",
 		"updated":      "🕒 *Обновлено в %s (Киев)*",
-		"alert_hdr":    "🕒 *Плановое обеспечение (%s)*",
-		"dynamics":     "Динамика зафиксирована",
-		"no_data":      "нет данных",
+		"alert_hdr":    "🕒 *Плановое обновление (%s)*",
+		"dynamics":     "Динамика цен за последние 15с",
 		"unit_m":       "мин",
 		"unit_h":       "ч",
-		"btn_upd":      "🔄 Обновить",
+		"btn_upd":      "🔄 Update",
+		"db_err":       "❌ Произошла техническая ошибка при сохранении данных. Пожалуйста, попробуйте позже.",
+		"no_data":      "нет данных",
 	},
 }
 
 func getMsgText(lang, key string) string {
-	muMsg.RLock()
-	defer muMsg.RUnlock()
 	if m, ok := messages[lang]; ok {
-		return m[key]
+		if text, exist := m[key]; exist && text != "" {
+			return text
+		}
 	}
-	return messages["ua"][key]
+	if text, exist := messages["ua"][key]; exist && text != "" {
+		return text
+	}
+	return "⚠️ [Missing Translation]"
+}
+
+
+func (a *App) sendSafeMessage(chatID int64, text string, markup interface{}) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	if markup != nil {
+		msg.ReplyMarkup = markup
+	}
+	if _, err := a.bot.Send(msg); err != nil {
+		slog.Error("failed to send message", "chat_id", chatID, "error", err)
+	}
+}
+
+func (a *App) editSafeMessage(
+	chatID int64,
+	messageID int,
+	text string,
+	markup *tgbotapi.InlineKeyboardMarkup,
+) {
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	edit.ParseMode = "Markdown"
+	if markup != nil {
+		edit.ReplyMarkup = markup
+	}
+	if _, err := a.bot.Send(edit); err != nil {
+		slog.Error(
+			"failed to edit message",
+			"message_id",
+			messageID,
+			"chat_id",
+			chatID,
+			"error",
+			err,
+		)
+	}
 }
 
 func getRefreshKeyboard(lang string) *tgbotapi.InlineKeyboardMarkup {
@@ -187,11 +247,12 @@ var langKeyboard = tgbotapi.NewInlineKeyboardMarkup(
 	),
 )
 
+
 func (a *App) startPriceTicker(ctx context.Context) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
-	log.Println("[Prices] Background price ticker started")
+	slog.Info("background crypto price ticker service started")
 	a.fetchAndCachePrices(ctx)
 
 	for {
@@ -199,7 +260,7 @@ func (a *App) startPriceTicker(ctx context.Context) {
 		case <-ticker.C:
 			a.fetchAndCachePrices(ctx)
 		case <-ctx.Done():
-			log.Println("[Prices] Background price ticker stopped")
+			slog.Info("background price ticker successfully stopped")
 			return
 		}
 	}
@@ -213,35 +274,54 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 			defer wg.Done()
 
 			url := fmt.Sprintf("https://api.binance.com/api/v3/ticker/price?symbol=%s", c.Symbol)
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 			if err != nil {
-				log.Printf("[Prices] Failed to create request for %s: %v", c.Symbol, err)
+				slog.Error("failed to create ticker request", "symbol", c.Symbol, "error", err)
 				return
 			}
 
 			resp, err := a.httpClient.Do(req)
 			if err != nil {
-				log.Printf("[Prices] Binance request failed for %s: %v", c.Symbol, err)
+				slog.Error("binance standard fetch failed", "symbol", c.Symbol, "error", err)
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
-				log.Printf("[Prices] Binance returned status %d for %s", resp.StatusCode, c.Symbol)
+				slog.Error(
+					"binance gateway returned non-200 status code",
+					"symbol",
+					c.Symbol,
+					"status",
+					resp.StatusCode,
+				)
 				return
 			}
 
 			var data struct {
 				Price string `json:"price"`
 			}
-			if err := json.NewDecoder(io.LimitReader(resp.Body, 102400)).Decode(&data); err != nil {
-				log.Printf("[Prices] Failed to decode Binance response for %s: %v", c.Symbol, err)
+			limitedBody := io.LimitReader(resp.Body, 102400)
+			if err := json.NewDecoder(limitedBody).Decode(&data); err != nil {
+				slog.Error(
+					"failed to decode binance ticker payload",
+					"symbol",
+					c.Symbol,
+					"error",
+					err,
+				)
 				return
 			}
 
 			price, err := strconv.ParseFloat(data.Price, 64)
 			if err != nil {
-				log.Printf("[Prices] Failed to parse Binance price for %s: %v", c.Symbol, err)
+				slog.Error(
+					"failed to parse standard float rate value",
+					"symbol",
+					c.Symbol,
+					"error",
+					err,
+				)
 				return
 			}
 
@@ -256,8 +336,15 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 				price,
 			)
 			dbCancel()
+
 			if err != nil {
-				log.Printf("[Prices] Failed to persist %s: %v", c.Symbol, err)
+				slog.Error(
+					"failed to sync newly fetched price values to data nodes",
+					"symbol",
+					c.Symbol,
+					"error",
+					err,
+				)
 			}
 		}(coin)
 	}
@@ -275,44 +362,37 @@ func (a *App) getFormattedPricesFromCache(lang string) string {
 
 		emoji := "⚪️"
 		percentChange := 0.0
+
 		if entry.Previous > 0 {
 			percentChange = ((entry.Current - entry.Previous) / entry.Previous) * 100
 		}
+
 		if percentChange > 0.001 {
 			emoji = "🟢"
 		} else if percentChange < -0.001 {
 			emoji = "🔴"
 		}
 
-		trend := fmt.Sprintf("%.2f%%", percentChange)
+		var trendStr string
 		if percentChange > 0 {
-			trend = fmt.Sprintf("+%.2f%%", percentChange)
-		}
-		if coin.Symbol == "USDTUAH" {
-			results[idx] = fmt.Sprintf("%s %s: *₴%.2f* (`%s`)", emoji, coin.Label, entry.Current, trend)
+			trendStr = fmt.Sprintf("+%.2f%%", percentChange)
 		} else {
-			results[idx] = fmt.Sprintf("%s %s: *$%.2f* (`%s`)", emoji, coin.Label, entry.Current, trend)
+			trendStr = fmt.Sprintf("%.2f%%", percentChange)
+		}
+
+		if coin.Symbol == "USDTUAH" {
+			results[idx] = fmt.Sprintf(
+				"%s %s: *₴%.2f* (`%s`)",
+				emoji,
+				coin.Label,
+				entry.Current,
+				trendStr,
+			)
+		} else {
+			results[idx] = fmt.Sprintf("%s %s: *$%.2f* (`%s`)", emoji, coin.Label, entry.Current, trendStr)
 		}
 	}
 	return strings.Join(results, "\n")
-}
-
-func (a *App) initDB(ctx context.Context) {
-	var err error
-	a.db, err = sql.Open("pgx", os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	a.db.SetMaxOpenConns(25)
-	a.db.SetMaxIdleConns(25)
-	a.db.SetConnMaxLifetime(5 * time.Minute)
-	a.db.SetConnMaxIdleTime(5 * time.Minute)
-
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := a.db.PingContext(pingCtx); err != nil {
-		log.Fatal("database unreachable: ", err)
-	}
 }
 
 func (a *App) getLang(ctx context.Context, chatID int64) string {
@@ -326,9 +406,11 @@ func (a *App) getLang(ctx context.Context, chatID int64) string {
 	if err != nil {
 		return "ua"
 	}
+
 	a.langCache.Add(chatID, lang)
 	return lang
 }
+
 
 func (a *App) WarmupCache(ctx context.Context) {
 	pricesCtx, pricesCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -336,139 +418,242 @@ func (a *App) WarmupCache(ctx context.Context) {
 
 	rows, err := a.db.QueryContext(pricesCtx, "SELECT symbol, price FROM market_prices")
 	if err != nil {
-		log.Printf("[Cache] Failed to warm up prices: %v", err)
+		slog.Error("warmup query engine pricing schema error", "error", err)
 		return
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var symbol string
-		var price float64
-		if err := rows.Scan(&symbol, &price); err != nil {
-			log.Printf("[Cache] Failed to scan price: %v", err)
+		var s string
+		var p float64
+		if err := rows.Scan(&s, &p); err != nil {
+			slog.Error("failed to scan warmup row chunk data", "error", err)
 			continue
 		}
-		a.priceCache.Store(symbol, price)
+		a.priceCache.Store(s, p)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error("warmup rows compilation iteration error", "error", err)
 	}
 
 	langsCtx, langsCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer langsCancel()
+
 	subRows, err := a.db.QueryContext(langsCtx, "SELECT chat_id, language_code FROM subscribers")
 	if err != nil {
-		log.Printf("[Cache] Failed to warm up languages: %v", err)
+		slog.Error("failed to execute dynamic warmup subscription cache codes", "error", err)
 		return
 	}
 	defer subRows.Close()
 
+	var loadedLangs int
 	for subRows.Next() {
-		var chatID int64
-		var lang string
-		if err := subRows.Scan(&chatID, &lang); err == nil {
-			a.langCache.Add(chatID, lang)
+		var id int64
+		var code string
+		if err := subRows.Scan(&id, &code); err == nil {
+			a.langCache.Add(id, code)
+			loadedLangs++
 		}
 	}
+	slog.Info(
+		"cache schema initialization completed successfully",
+		"prices",
+		len(trackedCoins),
+		"langs",
+		loadedLangs,
+	)
 }
 
-func (a *App) alertWorker(baseCtx context.Context, wg *sync.WaitGroup) {
+
+func (a *App) alertWorker(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	for job := range a.cronJobChan {
-		func() {
-			if job.DoneFunc != nil {
-				defer job.DoneFunc()
+	for {
+		select {
+		case job, ok := <-a.cronJobChan:
+			if !ok {
+				return
 			}
+			func() {
+				defer job.DoneFunc()
 
-			msg := tgbotapi.NewMessage(job.ChatID, job.Text)
-			msg.ParseMode = "Markdown"
-			msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
+				msg := tgbotapi.NewMessage(job.ChatID, job.Text)
+				msg.ParseMode = "Markdown"
+				msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
 
-			if _, err := a.bot.Send(msg); err == nil {
-				dbCtx, dbCancel := context.WithTimeout(baseCtx, 2*time.Second)
-				_, dbErr := a.db.ExecContext(
+				if _, err := a.bot.Send(msg); err != nil {
+					slog.Error(
+						"failed to send scheduled alert telegram packet",
+						"chat_id",
+						job.ChatID,
+						"error",
+						err,
+					)
+					return
+				}
+
+				dbCtx, dbCancel := context.WithTimeout(ctx, 2*time.Second)
+				_, err := a.db.ExecContext(
 					dbCtx,
 					"UPDATE subscribers SET last_sent = NOW() WHERE chat_id = $1",
 					job.ChatID,
 				)
 				dbCancel()
-				if dbErr != nil {
-					log.Printf("[DB Error] Failed to update last_sent for %d: %v", job.ChatID, dbErr)
+				if err != nil {
+					slog.Error(
+						"failed to update last delivery timestamp",
+						"chat_id",
+						job.ChatID,
+						"error",
+						err,
+					)
 				}
-			} else {
-				log.Printf("Failed to send cron alert to %d: %v", job.ChatID, err)
-			}
-		}()
+			}()
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
-func (a *App) updateWorker(wg *sync.WaitGroup) {
+func (a *App) updateWorker(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	for update := range a.telegramUpdateChan {
-		a.processTelegramUpdate(update)
+	for {
+		select {
+		case update, ok := <-a.telegramUpdateChan:
+			if !ok {
+				return
+			}
+			a.processTelegramUpdate(update)
+		case <-ctx.Done():
+			return
+		}
 	}
+}
+
+func safeSecretCompare(inputToken, expectedSecret string) bool {
+	if expectedSecret == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(inputToken), []byte(expectedSecret)) == 1
 }
 
 func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	var providedToken string
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		providedToken = authHeader[7:]
+	}
+
+	if a.cronSecret != "" && !safeSecretCompare(providedToken, a.cronSecret) {
+		slog.Warn(
+			"unauthorized block cron endpoint execution access triggered",
+			"remote_ip",
+			r.RemoteAddr,
+		)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
 	if !a.isCronRunning.CompareAndSwap(false, true) {
+		slog.Warn(
+			"prevented overlapping cron job execution, request discarded",
+			"remote_ip",
+			r.RemoteAddr,
+		)
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte("Cron execution already in progress"))
 		return
 	}
 	defer a.isCronRunning.Store(false)
 
-	log.Println("[Cron] Получен запрос от планировщика. Запуск рассылки...")
+	slog.Info("valid cron trigger received, initiating process execution loop")
 	ctx := r.Context()
 
 	currentTime := time.Now().In(a.kyivLoc).Format("15:04")
-
 	rows, err := a.db.QueryContext(ctx, `SELECT chat_id, language_code FROM subscribers
                                WHERE is_subscribed = TRUE
-                               AND last_sent <= NOW() - (interval_minutes * INTERVAL '1 minute') + INTERVAL '5 seconds'`)
+                               AND last_sent <= NOW() - (interval_minutes * INTERVAL '1 minute') + INTERVAL '59 second'
+                               ORDER BY last_sent ASC`)
 	if err != nil {
-		log.Println("DB Error:", err)
+		slog.Error("failed to fetch notification target chunk with pessimistic locks", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
+	var subs []Subscriber
+	for rows.Next() {
+		var s Subscriber
+		if err := rows.Scan(&s.ID, &s.Lang); err != nil {
+			continue
+		}
+		subs = append(subs, s)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error("error occurred during chunks array compilation", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if len(subs) == 0 {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("No subscribers to notify"))
+		return
+	}
+
 	var dispatchWG sync.WaitGroup
 
-	for rows.Next() {
-		var id int64
-		var lang string
-		if err := rows.Scan(&id, &lang); err == nil {
-			text := fmt.Sprintf(
-				getMsgText(lang, "alert_hdr")+"\n\n%s\n\n_%s_",
-				currentTime,
-				a.getFormattedPricesFromCache(lang),
-				getMsgText(lang, "dynamics"),
-			)
+	for _, s := range subs {
+		pricesTextLocal := a.getFormattedPricesFromCache(s.Lang)
+		header := fmt.Sprintf(getMsgText(s.Lang, "alert_hdr"), currentTime)
+		text := fmt.Sprintf(
+			"%s\n\n%s\n\n_%s_",
+			header,
+			pricesTextLocal,
+			getMsgText(s.Lang, "dynamics"),
+		)
 
-			dispatchWG.Add(1)
-			job := Job{
-				ChatID:   id,
-				Lang:     lang,
-				Text:     text,
-				DoneFunc: dispatchWG.Done,
-			}
-			select {
-			case a.cronJobChan <- job:
-			case <-ctx.Done():
-				dispatchWG.Done()
-				dispatchWG.Wait()
-				return
-			}
+		dispatchWG.Add(1)
+		job := Job{
+			ChatID:   s.ID,
+			Lang:     s.Lang,
+			Text:     text,
+			DoneFunc: func() { dispatchWG.Done() },
+		}
+
+		select {
+		case a.cronJobChan <- job:
+		case <-ctx.Done():
+			dispatchWG.Done()
+			slog.Warn(
+				"cron worker channel submission canceled due to context expiration/shutdown",
+				"chat_id",
+				s.ID,
+			)
+			return
 		}
 	}
 
 	dispatchWG.Wait()
+	slog.Info("all cron dispatch batch routines reported completion tasks successfully")
 
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Cron executed successfully"))
+	_, _ = w.Write([]byte("Cron processing completed"))
 }
 
 func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	providedSecret := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+	if a.webhookSecret != "" && !safeSecretCompare(providedSecret, a.webhookSecret) {
+		slog.Warn("unauthorized webhook attempt blocked", "remote_ip", r.RemoteAddr)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 	var update tgbotapi.Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		log.Printf("[Webhook Error] Ошибка декодирования JSON: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -478,47 +663,106 @@ func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	case <-time.After(1 * time.Second):
+		slog.Warn(
+			"telegram incoming update channel queue full, dropping packet and backpressuring",
+			"update_id",
+			update.UpdateID,
+		)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("503 Service Unavailable: Internal buffer saturated"))
 	}
 }
 
 func (a *App) processTelegramUpdate(update tgbotapi.Update) {
-	if update.CallbackQuery != nil {
-		data := update.CallbackQuery.Data
-		chatID := update.CallbackQuery.Message.Chat.ID
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-		if strings.HasPrefix(data, "setlang_") {
-			newLang := data[8:]
-			_, _ = a.db.Exec(`INSERT INTO subscribers (chat_id, language_code) VALUES ($1, $2)
-                     ON CONFLICT (chat_id) DO UPDATE SET language_code = $2`, chatID, newLang)
-			_, _ = a.bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
-			_, _ = a.bot.Send(tgbotapi.NewMessage(chatID, getMsgText(newLang, "lang_fixed")))
+	if update.CallbackQuery != nil {
+		if update.CallbackQuery.Message == nil {
+			slog.Warn(
+				"received inline callback query without message context object",
+				"callback_id",
+				update.CallbackQuery.ID,
+			)
 			return
 		}
 
-		lang := a.getLang(context.Background(), chatID)
+		data := update.CallbackQuery.Data
+		chatID := update.CallbackQuery.Message.Chat.ID
+		callbackID := update.CallbackQuery.ID
+
+		if strings.HasPrefix(data, "setlang_") {
+			newLang := data[8:]
+
+			if !allowedLanguages[newLang] {
+				slog.Error(
+					"security execution block triggered: invalid language query string",
+					"chat_id",
+					chatID,
+					"payload",
+					newLang,
+				)
+				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Invalid Language"))
+				return
+			}
+
+			if _, err := a.db.ExecContext(ctx, `INSERT INTO subscribers (chat_id, language_code) VALUES ($1, $2)
+                     ON CONFLICT (chat_id) DO UPDATE SET language_code = $2`, chatID, newLang); err != nil {
+				slog.Error(
+					"failed to save language settings for user node",
+					"chat_id",
+					chatID,
+					"error",
+					err,
+				)
+				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Error"))
+				a.sendSafeMessage(chatID, getMsgText("ua", "db_err"), nil)
+				return
+			}
+
+			a.langCache.Add(chatID, newLang)
+			_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "OK"))
+			a.sendSafeMessage(chatID, getMsgText(newLang, "lang_fixed"), nil)
+			return
+		}
+
+		lang := a.getLang(ctx, chatID)
 
 		if strings.HasPrefix(data, "int_") {
-			minutes, _ := strconv.Atoi(data[4:])
-			_, _ = a.db.Exec(
-				"UPDATE subscribers SET interval_minutes = $1, last_sent = NOW() WHERE chat_id = $2",
-				minutes,
-				chatID,
-			)
+			minutes, err := strconv.Atoi(data[4:])
+			if err != nil || minutes < 1 || minutes > 1440 {
+				slog.Warn("callback data validation failed",
+					slog.Group("security_alert",
+						slog.String("reason", "malicious_callback_range_violation"),
+						slog.Int64("chat_id", chatID),
+						slog.String("payload", data),
+					),
+				)
+				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Invalid Range"))
+				return
+			}
+
+			if _, err := a.db.ExecContext(ctx, "UPDATE subscribers SET interval_minutes = $1, last_sent = NOW() WHERE chat_id = $2", minutes, chatID); err != nil {
+				slog.Error(
+					"failed to update notification frequency interval",
+					"chat_id",
+					chatID,
+					"error",
+					err,
+				)
+				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Error"))
+				a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
+				return
+			}
+
 			unit := getMsgText(lang, "unit_m")
 			val := minutes
 			if minutes >= 60 {
 				unit = getMsgText(lang, "unit_h")
 				val = minutes / 60
 			}
-			_, _ = a.bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
-			_, _ = a.bot.Send(
-				tgbotapi.NewMessage(
-					chatID,
-					fmt.Sprintf(getMsgText(lang, "interval_set"), val, unit),
-				),
-			)
+			_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "OK"))
+			a.sendSafeMessage(chatID, fmt.Sprintf(getMsgText(lang, "interval_set"), val, unit), nil)
 			return
 		}
 
@@ -531,15 +775,14 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 				prices,
 				getMsgText(lang, "dynamics"),
 			)
-			edit := tgbotapi.NewEditMessageText(
+
+			a.editSafeMessage(
 				chatID,
 				update.CallbackQuery.Message.MessageID,
 				text,
+				getRefreshKeyboard(lang),
 			)
-			edit.ParseMode = "Markdown"
-			edit.ReplyMarkup = getRefreshKeyboard(lang)
-			_, _ = a.bot.Send(edit)
-			_, _ = a.bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
+			_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "OK"))
 		}
 		return
 	}
@@ -548,102 +791,211 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 		return
 	}
 	chatID := update.Message.Chat.ID
-	lang := a.getLang(context.Background(), chatID)
+	lang := a.getLang(ctx, chatID)
 
-	switch update.Message.Command() {
+	cmd := update.Message.Command()
+	if strings.Contains(cmd, "@") {
+		cmd = strings.Split(cmd, "@")[0]
+	}
+
+	switch cmd {
 	case "start":
-		msg := tgbotapi.NewMessage(chatID, getMsgText(lang, "welcome"))
-		msg.ParseMode = "Markdown"
-		_, _ = a.bot.Send(msg)
+		a.sendSafeMessage(chatID, getMsgText(lang, "welcome"), nil)
 	case "language":
-		msg := tgbotapi.NewMessage(chatID, getMsgText(lang, "lang_sel"))
-		msg.ReplyMarkup = langKeyboard
-		_, _ = a.bot.Send(msg)
+		a.sendSafeMessage(chatID, getMsgText(lang, "lang_sel"), langKeyboard)
 	case "subscribe":
-		_, _ = a.db.Exec(
-			`INSERT INTO subscribers (chat_id, interval_minutes, last_sent, language_code, is_subscribed)
-                 VALUES ($1, 60, NOW(), 'ua', TRUE) ON CONFLICT (chat_id) DO UPDATE SET is_subscribed = TRUE`,
-			chatID,
-		)
-		_, _ = a.bot.Send(tgbotapi.NewMessage(chatID, getMsgText(lang, "subscribe")))
+		if _, err := a.db.ExecContext(ctx, `INSERT INTO subscribers (chat_id, interval_minutes, last_sent, language_code, is_subscribed)
+                 VALUES ($1, 60, NOW() - INTERVAL '2 minute', $2, TRUE) ON CONFLICT (chat_id) DO UPDATE SET is_subscribed = TRUE`, chatID, lang); err != nil {
+			slog.Error("subscriber activation failed", "chat_id", chatID, "error", err)
+			a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
+			return
+		}
+		a.sendSafeMessage(chatID, getMsgText(lang, "subscribe"), nil)
 	case "unsubscribe":
-		_, _ = a.db.Exec("UPDATE subscribers SET is_subscribed = FALSE WHERE chat_id = $1", chatID)
-		_, _ = a.bot.Send(tgbotapi.NewMessage(chatID, getMsgText(lang, "unsubscribe")))
+		if _, err := a.db.ExecContext(ctx, "UPDATE subscribers SET is_subscribed = FALSE WHERE chat_id = $1", chatID); err != nil {
+			slog.Error("deactivation sql command failed", "chat_id", chatID, "error", err)
+			a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
+			return
+		}
+		a.sendSafeMessage(chatID, getMsgText(lang, "unsubscribe"), nil)
 	case "interval":
-		msg := tgbotapi.NewMessage(chatID, getMsgText(lang, "interval_m"))
-		msg.ParseMode = "Markdown"
-		msg.ReplyMarkup = getIntervalKeyboard(lang)
-		_, _ = a.bot.Send(msg)
+		a.sendSafeMessage(chatID, getMsgText(lang, "interval_m"), getIntervalKeyboard(lang))
 	case "price":
 		prices := a.getFormattedPricesFromCache(lang)
 		text := fmt.Sprintf(getMsgText(lang, "price_hdr")+"\n\n%s", prices)
-		msg := tgbotapi.NewMessage(chatID, text)
-		msg.ParseMode = "Markdown"
-		msg.ReplyMarkup = getRefreshKeyboard(lang)
-		_, _ = a.bot.Send(msg)
+		a.sendSafeMessage(chatID, text, getRefreshKeyboard(lang))
 	}
 }
 
 func main() {
 	_ = godotenv.Load()
 
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	kyivLocation, tzErr := time.LoadLocation("Europe/Kyiv")
+	if tzErr != nil {
+		slog.Error(
+			"failed to parse Europe/Kyiv timezone, safety fallback activated",
+			"error",
+			tzErr,
+		)
+		kyivLocation = time.FixedZone("Kyiv", 3*60*60)
+	}
+
+	customHTTPClient := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 30,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	rawDB, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		slog.Error("failed to initialize connection pool", "error", err)
+		os.Exit(1)
+	}
+	rawDB.SetMaxOpenConns(25)
+	rawDB.SetMaxIdleConns(25)
+	rawDB.SetConnMaxLifetime(5 * time.Minute)
+	rawDB.SetConnMaxIdleTime(5 * time.Minute)
+
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := rawDB.PingContext(pingCtx); err != nil {
+		pingCancel()
+		slog.Error("database unreachable", "error", err)
+		os.Exit(1)
+	}
+	pingCancel()
+
+	isolatedBotToken := os.Getenv("TELEGRAM_APITOKEN")
+	if isolatedBotToken == "" {
+		slog.Error("configuration error: TELEGRAM_APITOKEN missing")
+		os.Exit(1)
+	}
+
+	tgBot, err := tgbotapi.NewBotAPI(isolatedBotToken)
+	if err != nil {
+		slog.Error("failed to initialize bot API", "error", err)
+		os.Exit(1)
+	}
+
+	webhookSecretToken := os.Getenv("WEBHOOK_SECRET_TOKEN")
+	if webhookSecretToken == "" {
+		slog.Error("configuration error: WEBHOOK_SECRET_TOKEN missing")
+		os.Exit(1)
+	}
+
+	cronSecretToken := os.Getenv("CRON_SECRET")
+	if cronSecretToken == "" {
+		slog.Error("configuration error: CRON_SECRET missing")
+		os.Exit(1)
+	}
+
+	lruCacheInstance, cacheErr := lru.New[int64, string](50000)
+	if cacheErr != nil {
+		slog.Error("failed to initialize LRU cache store", "error", cacheErr)
+		os.Exit(1)
+	}
+
+	telegramUpdateChanInstance := make(chan tgbotapi.Update, 1000)
+	cronJobChanInstance := make(chan Job, 5000)
+
 	app := &App{
-		telegramUpdateChan: make(chan tgbotapi.Update, 1000),
-		cronJobChan:        make(chan Job, 5000),
-		kyivLoc:            time.FixedZone("Kyiv", 2*60*60),
-		httpClient:         &http.Client{Timeout: 4 * time.Second},
-	}
-	cache, err := lru.New[int64, string](50000)
-	if err != nil {
-		log.Fatal(err)
-	}
-	app.priceCache = &PriceCache{store: make(map[string]PriceEntry)}
-	app.langCache = cache
-	app.initDB(context.Background())
-	app.WarmupCache(context.Background())
-	go app.startPriceTicker(context.Background())
-
-	botToken := os.Getenv("TELEGRAM_APITOKEN")
-	if botToken == "" {
-		log.Fatal("TELEGRAM_APITOKEN is not set")
+		db:                 rawDB,
+		bot:                tgBot,
+		priceCache:         &PriceCache{store: make(map[string]PriceEntry)},
+		langCache:          lruCacheInstance,
+		telegramUpdateChan: telegramUpdateChanInstance,
+		cronJobChan:        cronJobChanInstance,
+		kyivLoc:            kyivLocation,
+		httpClient:         customHTTPClient,
+		webhookSecret:      webhookSecretToken,
+		cronSecret:         cronSecretToken,
 	}
 
-	tgBot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		log.Fatal(err)
-	}
-	app.bot = tgBot
-	log.Printf("[Success] Бот авторизован под именем: %s", app.bot.Self.UserName)
+	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	var updateWG sync.WaitGroup
-	for i := 0; i < 20; i++ {
-		updateWG.Add(1)
-		go app.updateWorker(&updateWG)
+	app.WarmupCache(runCtx)
+
+	go app.startPriceTicker(runCtx)
+
+	var telegramWG sync.WaitGroup
+	for i := 1; i <= 20; i++ {
+		telegramWG.Add(1)
+		go app.updateWorker(runCtx, &telegramWG)
 	}
 
 	var cronWG sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	for i := 1; i <= 5; i++ {
 		cronWG.Add(1)
-		go app.alertWorker(context.Background(), &cronWG)
+		go app.alertWorker(runCtx, &cronWG)
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Bot server is running perfectly!"))
+		_, _ = w.Write([]byte("OK"))
 	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		dbCheckCtx, dbCheckCancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer dbCheckCancel()
 
-	// Роут для крона
-	http.HandleFunc("/cron", app.handleCron)
+		if err := app.db.PingContext(dbCheckCtx); err != nil {
+			slog.Error("readiness check failed: database down", "error", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("503 Service Unavailable: Database Unreachable"))
+			return
+		}
 
-	http.HandleFunc("/webhook/"+botToken, app.handleWebhook)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("Ready"))
+	})
+	mux.HandleFunc("/cron", app.handleCron)
+	mux.HandleFunc("/webhook", app.handleWebhook)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	log.Printf("[Info] HTTP Сервер запущен на порту %s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("[Critical] Ошибка запуска сервера: %v", err)
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
 	}
+
+	go func() {
+		slog.Info("HTTP server started", "port", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server termination error", "error", err)
+			stop()
+		}
+	}()
+
+	<-runCtx.Done()
+	slog.Info("shutdown signal intercepted")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("server shutdown error", "error", err)
+	}
+
+	close(app.telegramUpdateChan)
+	close(app.cronJobChan)
+
+	telegramWG.Wait()
+	cronWG.Wait()
+	slog.Info("background worker pools stopped")
+
+	rawDB.Close()
+	slog.Info("database connections closed. process exited successfully.")
 }
