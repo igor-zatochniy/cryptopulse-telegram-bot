@@ -18,13 +18,14 @@ import (
 	_ "github.com/lib/pq"
 )
 
-var (
-	db       *sql.DB
-	kyivLoc  = time.FixedZone("Kyiv", 2*60*60)
-	bot      *tgbotapi.BotAPI
-	muMsg    sync.RWMutex
-	botToken string
-)
+type App struct {
+	db         *sql.DB
+	bot        *tgbotapi.BotAPI
+	kyivLoc    *time.Location
+	httpClient *http.Client
+}
+
+var muMsg sync.RWMutex
 
 var trackedCoins = []struct {
 	Symbol string
@@ -141,10 +142,9 @@ var langKeyboard = tgbotapi.NewInlineKeyboardMarkup(
 	),
 )
 
-func getAllPricesFormatted(ctx context.Context) string {
+func (a *App) getAllPricesFormatted(ctx context.Context) string {
 	var wg sync.WaitGroup
 	results := make([]string, len(trackedCoins))
-	client := http.Client{Timeout: 4 * time.Second}
 
 	for i, coin := range trackedCoins {
 		wg.Add(1)
@@ -158,7 +158,7 @@ func getAllPricesFormatted(ctx context.Context) string {
 				return
 			}
 
-			resp, err := client.Do(req)
+			resp, err := a.httpClient.Do(req)
 			if err != nil {
 				results[idx] = fmt.Sprintf("⚪️ %s: err", c.Label)
 				return
@@ -176,7 +176,7 @@ func getAllPricesFormatted(ctx context.Context) string {
 			currentPrice, _ := strconv.ParseFloat(data.Price, 64)
 
 			var lastPrice float64
-			_ = db.QueryRowContext(ctx, "SELECT price FROM market_prices WHERE symbol = $1", c.Symbol).
+			_ = a.db.QueryRowContext(ctx, "SELECT price FROM market_prices WHERE symbol = $1", c.Symbol).
 				Scan(&lastPrice)
 
 			emoji := "⚪️"
@@ -192,7 +192,7 @@ func getAllPricesFormatted(ctx context.Context) string {
 				}
 			}
 
-			_, _ = db.ExecContext(ctx, `INSERT INTO market_prices (symbol, price) VALUES ($1, $2)
+			_, _ = a.db.ExecContext(ctx, `INSERT INTO market_prices (symbol, price) VALUES ($1, $2)
 				 ON CONFLICT (symbol) DO UPDATE SET price = EXCLUDED.price`, c.Symbol, currentPrice)
 
 			if c.Symbol == "USDTUAH" {
@@ -213,30 +213,30 @@ func getAllPricesFormatted(ctx context.Context) string {
 	return strings.Join(results, "\n")
 }
 
-func initDB() {
+func (a *App) initDB() {
 	var err error
-	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	a.db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(25)
+	a.db.SetMaxOpenConns(25)
+	a.db.SetMaxIdleConns(25)
 
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS subscribers (
+	_, _ = a.db.Exec(`CREATE TABLE IF NOT EXISTS subscribers (
 		chat_id BIGINT PRIMARY KEY,
 		interval_minutes INT DEFAULT 60,
 		last_sent TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 		language_code TEXT DEFAULT 'ua',
 		is_subscribed BOOLEAN DEFAULT FALSE
 	);`)
-	_, _ = db.Exec(
+	_, _ = a.db.Exec(
 		`CREATE TABLE IF NOT EXISTS market_prices (symbol TEXT PRIMARY KEY, price DOUBLE PRECISION);`,
 	)
 }
 
-func getLang(chatID int64) string {
+func (a *App) getLang(chatID int64) string {
 	var lang string
-	err := db.QueryRow("SELECT language_code FROM subscribers WHERE chat_id = $1", chatID).
+	err := a.db.QueryRow("SELECT language_code FROM subscribers WHERE chat_id = $1", chatID).
 		Scan(&lang)
 	if err != nil {
 		return "ua"
@@ -245,16 +245,16 @@ func getLang(chatID int64) string {
 }
 
 // --- ПУЛ ВОРКЕРОВ ДЛЯ КРОНА ---
-func alertWorker(baseCtx context.Context, jobs <-chan Job, wg *sync.WaitGroup) {
+func (a *App) alertWorker(baseCtx context.Context, jobs <-chan Job, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for job := range jobs {
 		msg := tgbotapi.NewMessage(job.ChatID, job.Text)
 		msg.ParseMode = "Markdown"
 		msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
 
-		if _, err := bot.Send(msg); err == nil {
+		if _, err := a.bot.Send(msg); err == nil {
 			dbCtx, dbCancel := context.WithTimeout(baseCtx, 2*time.Second)
-			_, dbErr := db.ExecContext(
+			_, dbErr := a.db.ExecContext(
 				dbCtx,
 				"UPDATE subscribers SET last_sent = NOW() WHERE chat_id = $1",
 				job.ChatID,
@@ -269,15 +269,14 @@ func alertWorker(baseCtx context.Context, jobs <-chan Job, wg *sync.WaitGroup) {
 	}
 }
 
-
-func handleCron(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	log.Println("[Cron] Получен запрос от планировщика. Запуск рассылки...")
 	ctx := r.Context()
 
-	pricesText := getAllPricesFormatted(ctx)
-	currentTime := time.Now().In(kyivLoc).Format("15:04")
+	pricesText := a.getAllPricesFormatted(ctx)
+	currentTime := time.Now().In(a.kyivLoc).Format("15:04")
 
-	rows, err := db.QueryContext(ctx, `SELECT chat_id, language_code FROM subscribers
+	rows, err := a.db.QueryContext(ctx, `SELECT chat_id, language_code FROM subscribers
                                WHERE is_subscribed = TRUE
                                AND last_sent <= NOW() - (interval_minutes * INTERVAL '1 minute') + INTERVAL '5 seconds'`)
 	if err != nil {
@@ -292,7 +291,7 @@ func handleCron(w http.ResponseWriter, r *http.Request) {
 
 	for i := 1; i <= 5; i++ {
 		workerWG.Add(1)
-		go alertWorker(context.Background(), jobs, &workerWG)
+		go a.alertWorker(context.Background(), jobs, &workerWG)
 	}
 
 	for rows.Next() {
@@ -322,7 +321,7 @@ func handleCron(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Cron executed successfully"))
 }
 
-func handleWebhook(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	var update tgbotapi.Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		log.Printf("[Webhook Error] Ошибка декодирования JSON: %v", err)
@@ -332,28 +331,28 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 
-	go processTelegramUpdate(update)
+	go a.processTelegramUpdate(update)
 }
 
-func processTelegramUpdate(update tgbotapi.Update) {
+func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 	if update.CallbackQuery != nil {
 		data := update.CallbackQuery.Data
 		chatID := update.CallbackQuery.Message.Chat.ID
 
 		if strings.HasPrefix(data, "setlang_") {
 			newLang := data[8:]
-			_, _ = db.Exec(`INSERT INTO subscribers (chat_id, language_code) VALUES ($1, $2)
+			_, _ = a.db.Exec(`INSERT INTO subscribers (chat_id, language_code) VALUES ($1, $2)
                      ON CONFLICT (chat_id) DO UPDATE SET language_code = $2`, chatID, newLang)
-			_, _ = bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, getMsgText(newLang, "lang_fixed")))
+			_, _ = a.bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
+			_, _ = a.bot.Send(tgbotapi.NewMessage(chatID, getMsgText(newLang, "lang_fixed")))
 			return
 		}
 
-		lang := getLang(chatID)
+		lang := a.getLang(chatID)
 
 		if strings.HasPrefix(data, "int_") {
 			minutes, _ := strconv.Atoi(data[4:])
-			_, _ = db.Exec(
+			_, _ = a.db.Exec(
 				"UPDATE subscribers SET interval_minutes = $1, last_sent = NOW() WHERE chat_id = $2",
 				minutes,
 				chatID,
@@ -364,8 +363,8 @@ func processTelegramUpdate(update tgbotapi.Update) {
 				unit = getMsgText(lang, "unit_h")
 				val = minutes / 60
 			}
-			_, _ = bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
-			_, _ = bot.Send(
+			_, _ = a.bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
+			_, _ = a.bot.Send(
 				tgbotapi.NewMessage(
 					chatID,
 					fmt.Sprintf(getMsgText(lang, "interval_set"), val, unit),
@@ -375,8 +374,8 @@ func processTelegramUpdate(update tgbotapi.Update) {
 		}
 
 		if data == "refresh_price" {
-			prices := getAllPricesFormatted(context.Background())
-			t := time.Now().In(kyivLoc).Format("15:04:05")
+			prices := a.getAllPricesFormatted(context.Background())
+			t := time.Now().In(a.kyivLoc).Format("15:04:05")
 			text := fmt.Sprintf(
 				getMsgText(lang, "updated")+"\n\n%s\n\n_%s_",
 				t,
@@ -390,8 +389,8 @@ func processTelegramUpdate(update tgbotapi.Update) {
 			)
 			edit.ParseMode = "Markdown"
 			edit.ReplyMarkup = getRefreshKeyboard(lang)
-			_, _ = bot.Send(edit)
-			_, _ = bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
+			_, _ = a.bot.Send(edit)
+			_, _ = a.bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "OK"))
 		}
 		return
 	}
@@ -400,57 +399,62 @@ func processTelegramUpdate(update tgbotapi.Update) {
 		return
 	}
 	chatID := update.Message.Chat.ID
-	lang := getLang(chatID)
+	lang := a.getLang(chatID)
 
 	switch update.Message.Command() {
 	case "start":
 		msg := tgbotapi.NewMessage(chatID, getMsgText(lang, "welcome"))
 		msg.ParseMode = "Markdown"
-		_, _ = bot.Send(msg)
+		_, _ = a.bot.Send(msg)
 	case "language":
 		msg := tgbotapi.NewMessage(chatID, getMsgText(lang, "lang_sel"))
 		msg.ReplyMarkup = langKeyboard
-		_, _ = bot.Send(msg)
+		_, _ = a.bot.Send(msg)
 	case "subscribe":
-		_, _ = db.Exec(
+		_, _ = a.db.Exec(
 			`INSERT INTO subscribers (chat_id, interval_minutes, last_sent, language_code, is_subscribed)
                  VALUES ($1, 60, NOW(), 'ua', TRUE) ON CONFLICT (chat_id) DO UPDATE SET is_subscribed = TRUE`,
 			chatID,
 		)
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, getMsgText(lang, "subscribe")))
+		_, _ = a.bot.Send(tgbotapi.NewMessage(chatID, getMsgText(lang, "subscribe")))
 	case "unsubscribe":
-		_, _ = db.Exec("UPDATE subscribers SET is_subscribed = FALSE WHERE chat_id = $1", chatID)
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, getMsgText(lang, "unsubscribe")))
+		_, _ = a.db.Exec("UPDATE subscribers SET is_subscribed = FALSE WHERE chat_id = $1", chatID)
+		_, _ = a.bot.Send(tgbotapi.NewMessage(chatID, getMsgText(lang, "unsubscribe")))
 	case "interval":
 		msg := tgbotapi.NewMessage(chatID, getMsgText(lang, "interval_m"))
 		msg.ParseMode = "Markdown"
 		msg.ReplyMarkup = getIntervalKeyboard(lang)
-		_, _ = bot.Send(msg)
+		_, _ = a.bot.Send(msg)
 	case "price":
-		prices := getAllPricesFormatted(context.Background())
+		prices := a.getAllPricesFormatted(context.Background())
 		text := fmt.Sprintf(getMsgText(lang, "price_hdr")+"\n\n%s", prices)
 		msg := tgbotapi.NewMessage(chatID, text)
 		msg.ParseMode = "Markdown"
 		msg.ReplyMarkup = getRefreshKeyboard(lang)
-		_, _ = bot.Send(msg)
+		_, _ = a.bot.Send(msg)
 	}
 }
 
 func main() {
 	_ = godotenv.Load()
-	initDB()
 
-	botToken = os.Getenv("TELEGRAM_APITOKEN")
+	app := &App{
+		kyivLoc:    time.FixedZone("Kyiv", 2*60*60),
+		httpClient: &http.Client{Timeout: 4 * time.Second},
+	}
+	app.initDB()
+
+	botToken := os.Getenv("TELEGRAM_APITOKEN")
 	if botToken == "" {
 		log.Fatal("TELEGRAM_APITOKEN is not set")
 	}
 
-	var err error
-	bot, err = tgbotapi.NewBotAPI(botToken)
+	tgBot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("[Success] Бот авторизован под именем: %s", bot.Self.UserName)
+	app.bot = tgBot
+	log.Printf("[Success] Бот авторизован под именем: %s", app.bot.Self.UserName)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -458,9 +462,9 @@ func main() {
 	})
 
 	// Роут для крона
-	http.HandleFunc("/cron", handleCron)
+	http.HandleFunc("/cron", app.handleCron)
 
-	http.HandleFunc("/webhook/"+botToken, handleWebhook)
+	http.HandleFunc("/webhook/"+botToken, app.handleWebhook)
 
 	port := os.Getenv("PORT")
 	if port == "" {
