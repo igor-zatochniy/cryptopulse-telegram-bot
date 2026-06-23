@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+Dockerfile*
+*.log
+*.md
+bot
+.gitignore
+/tmp
