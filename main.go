@@ -26,6 +26,9 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 )
 
@@ -130,6 +133,59 @@ var trackedCoins = []struct {
 	{"USDTUAH", "USDT"},
 }
 
+const cronBatchLimit = 100
+
+var (
+	cronRunsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "eth_course_cron_runs_total",
+			Help: "Total number of cron endpoint executions by result status.",
+		},
+		[]string{"status"},
+	)
+	cronClaimedSubscribersTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "eth_course_cron_claimed_subscribers_total",
+			Help: "Total number of subscribers claimed by cron batches.",
+		},
+	)
+	cronDeliveriesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "eth_course_cron_deliveries_total",
+			Help: "Total number of scheduled Telegram delivery attempts by result status.",
+		},
+		[]string{"status"},
+	)
+	webhookUpdatesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "eth_course_webhook_updates_total",
+			Help: "Total number of Telegram webhook updates by result status.",
+		},
+		[]string{"status"},
+	)
+	telegramSendErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "eth_course_telegram_send_errors_total",
+			Help: "Total number of Telegram send/edit errors by type.",
+		},
+		[]string{"type"},
+	)
+	binanceRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "eth_course_binance_requests_total",
+			Help: "Total number of Binance ticker requests by symbol and result status.",
+		},
+		[]string{"symbol", "status"},
+	)
+	dbOperationsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "eth_course_db_operations_total",
+			Help: "Total number of database operations by operation name and result status.",
+		},
+		[]string{"operation", "status"},
+	)
+)
+
 var allowedLanguages = map[string]bool{
 	"ua": true,
 	"en": true,
@@ -218,6 +274,7 @@ func (a *App) sendSafeMessage(chatID int64, text string, markup interface{}) {
 		msg.ReplyMarkup = markup
 	}
 	if _, err := a.bot.Send(msg); err != nil {
+		telegramSendErrorsTotal.WithLabelValues("interactive_message").Inc()
 		slog.Error("failed to send message", "chat_id", chatID, "error", err)
 	}
 }
@@ -234,6 +291,7 @@ func (a *App) editSafeMessage(
 		edit.ReplyMarkup = markup
 	}
 	if _, err := a.bot.Send(edit); err != nil {
+		telegramSendErrorsTotal.WithLabelValues("interactive_edit").Inc()
 		slog.Error(
 			"failed to edit message",
 			"message_id",
@@ -314,18 +372,21 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 			url := fmt.Sprintf("https://api.binance.com/api/v3/ticker/price?symbol=%s", c.Symbol)
 			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 			if err != nil {
+				binanceRequestsTotal.WithLabelValues(c.Symbol, "request_create_error").Inc()
 				slog.Error("failed to create ticker request", "symbol", c.Symbol, "error", err)
 				return
 			}
 
 			resp, err := a.httpClient.Do(req)
 			if err != nil {
+				binanceRequestsTotal.WithLabelValues(c.Symbol, "request_error").Inc()
 				slog.Error("binance standard fetch failed", "symbol", c.Symbol, "error", err)
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
+				binanceRequestsTotal.WithLabelValues(c.Symbol, "bad_status").Inc()
 				slog.Error(
 					"binance gateway returned non-200 status code",
 					"symbol",
@@ -341,6 +402,7 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 			}
 			limitedBody := io.LimitReader(resp.Body, 102400)
 			if err := json.NewDecoder(limitedBody).Decode(&data); err != nil {
+				binanceRequestsTotal.WithLabelValues(c.Symbol, "decode_error").Inc()
 				slog.Error(
 					"failed to decode binance ticker payload",
 					"symbol",
@@ -353,6 +415,7 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 
 			price, err := strconv.ParseFloat(data.Price, 64)
 			if err != nil {
+				binanceRequestsTotal.WithLabelValues(c.Symbol, "parse_error").Inc()
 				slog.Error(
 					"failed to parse standard float rate value",
 					"symbol",
@@ -376,6 +439,7 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 			dbCancel()
 
 			if err != nil {
+				dbOperationsTotal.WithLabelValues("price_upsert", "error").Inc()
 				slog.Error(
 					"failed to sync newly fetched price values to data nodes",
 					"symbol",
@@ -383,7 +447,11 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 					"error",
 					err,
 				)
+				return
 			}
+
+			dbOperationsTotal.WithLabelValues("price_upsert", "success").Inc()
+			binanceRequestsTotal.WithLabelValues(c.Symbol, "success").Inc()
 		}(coin)
 	}
 	wg.Wait()
@@ -523,6 +591,7 @@ func (a *App) alertWorker(ctx context.Context, wg *sync.WaitGroup) {
 				msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
 
 				if _, err := a.bot.Send(msg); err != nil {
+					errorType := "transient"
 					slog.Error(
 						"failed to send scheduled alert telegram packet",
 						"chat_id",
@@ -532,12 +601,16 @@ func (a *App) alertWorker(ctx context.Context, wg *sync.WaitGroup) {
 					)
 
 					if isPermanentTelegramSendError(err) {
+						errorType = "permanent"
 						a.markSubscriberUnsubscribed(job.ChatID)
 					}
 
+					telegramSendErrorsTotal.WithLabelValues(errorType).Inc()
+					cronDeliveriesTotal.WithLabelValues("failed_" + errorType).Inc()
 					return
 				}
 
+				cronDeliveriesTotal.WithLabelValues("sent").Inc()
 				job.Collector.Add(job.ChatID)
 			}()
 		case <-ctx.Done():
@@ -669,8 +742,12 @@ func (a *App) markSubscriberUnsubscribed(chatID int64) {
 		"UPDATE subscribers SET is_subscribed = FALSE, cron_claimed_until = NULL WHERE chat_id = $1",
 		chatID,
 	); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_unsubscribed", "error").Inc()
 		slog.Error("failed to mark subscriber as unsubscribed", "chat_id", chatID, "error", err)
+		return
 	}
+
+	dbOperationsTotal.WithLabelValues("mark_unsubscribed", "success").Inc()
 }
 
 func subscriberIDs(subs []Subscriber) []int64 {
@@ -687,6 +764,7 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 
 	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
+		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 		return nil, err
 	}
 	defer tx.Rollback()
@@ -698,15 +776,16 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 		AND COALESCE(last_sent, TIMESTAMP 'epoch') <= NOW() - (COALESCE(interval_minutes, 60) * INTERVAL '1 minute') + INTERVAL '59 second'
 		AND (cron_claimed_until IS NULL OR cron_claimed_until < NOW())
 		ORDER BY last_sent ASC NULLS FIRST
-		LIMIT 5000
+		LIMIT $1
 		FOR UPDATE SKIP LOCKED
 	)
 	UPDATE subscribers AS s
 	SET cron_claimed_until = NOW() + INTERVAL '2 minute'
 	FROM due
 	WHERE s.chat_id = due.chat_id
-	RETURNING s.chat_id, COALESCE(s.language_code, 'ua')`)
+	RETURNING s.chat_id, COALESCE(s.language_code, 'ua')`, cronBatchLimit)
 	if err != nil {
+		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 		return nil, err
 	}
 
@@ -715,6 +794,7 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 		var sub Subscriber
 		if err := rows.Scan(&sub.ID, &sub.Lang); err != nil {
 			_ = rows.Close()
+			dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 			return nil, err
 		}
 		subs = append(subs, sub)
@@ -722,16 +802,20 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
+		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
+		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 		return nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
+		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 		return nil, err
 	}
 
+	dbOperationsTotal.WithLabelValues("claim_due_subscribers", "success").Inc()
 	return subs, nil
 }
 
@@ -748,6 +832,12 @@ func (a *App) markCronDeliveriesSent(ids []int64) error {
 		"UPDATE subscribers SET last_sent = NOW(), cron_claimed_until = NULL WHERE chat_id = ANY($1)",
 		any(ids),
 	)
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("mark_cron_sent", "error").Inc()
+		return err
+	}
+
+	dbOperationsTotal.WithLabelValues("mark_cron_sent", "success").Inc()
 	return err
 }
 
@@ -764,6 +854,12 @@ func (a *App) releaseCronClaims(ids []int64) error {
 		"UPDATE subscribers SET cron_claimed_until = NULL WHERE chat_id = ANY($1)",
 		any(ids),
 	)
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("release_cron_claims", "error").Inc()
+		return err
+	}
+
+	dbOperationsTotal.WithLabelValues("release_cron_claims", "success").Inc()
 	return err
 }
 func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
@@ -774,6 +870,7 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if a.cronSecret != "" && !safeSecretCompare(providedToken, a.cronSecret) {
+		cronRunsTotal.WithLabelValues("unauthorized").Inc()
 		slog.Warn(
 			"unauthorized block cron endpoint execution access triggered",
 			"remote_ip",
@@ -784,6 +881,7 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !a.isCronRunning.CompareAndSwap(false, true) {
+		cronRunsTotal.WithLabelValues("conflict").Inc()
 		slog.Warn(
 			"prevented overlapping cron job execution, request discarded",
 			"remote_ip",
@@ -801,17 +899,20 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	currentTime := time.Now().In(a.kyivLoc).Format("15:04")
 	subs, err := a.claimDueSubscribers(ctx)
 	if err != nil {
+		cronRunsTotal.WithLabelValues("claim_error").Inc()
 		slog.Error("failed to claim notification target batch", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	if len(subs) == 0 {
+		cronRunsTotal.WithLabelValues("no_subscribers").Inc()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("No subscribers to notify"))
 		return
 	}
 
+	cronClaimedSubscribersTotal.Add(float64(len(subs)))
 	allIDs := subscriberIDs(subs)
 	collector := &SafeIDCollector{ids: make([]int64, 0, len(subs))}
 	var dispatchWG sync.WaitGroup
@@ -838,6 +939,8 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 		select {
 		case a.cronJobChan <- job:
 		case <-ctx.Done():
+			cronRunsTotal.WithLabelValues("enqueue_canceled").Inc()
+			cronDeliveriesTotal.WithLabelValues("enqueue_canceled").Inc()
 			dispatchWG.Done()
 			slog.Warn(
 				"cron worker channel submission canceled due to context expiration/shutdown",
@@ -848,49 +951,32 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	doneChan := make(chan struct{})
-	go func() {
-		dispatchWG.Wait()
-		close(doneChan)
-	}()
-
-	select {
-	case <-doneChan:
-		slog.Info("all cron dispatch batch routines reported completion tasks successfully")
-	case <-time.After(12 * time.Second):
-		slog.Error("cron worker tracking process hit execution pool barrier timeout limits, saving completed deliveries")
-
-		partialIDs := collector.FlushIDs()
-		if err := a.markCronDeliveriesSent(partialIDs); err != nil {
-			slog.Error("failed to save partial success timestamps after cron timeout", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		w.WriteHeader(http.StatusGatewayTimeout)
-		_, _ = w.Write([]byte("Cron execution pool barrier timeout hit. Partial data saved."))
-		return
-	}
+	dispatchWG.Wait()
+	slog.Info("all cron dispatch batch routines reported completion tasks successfully")
 
 	successIDs := collector.FlushIDs()
 	if err := a.markCronDeliveriesSent(successIDs); err != nil {
+		cronRunsTotal.WithLabelValues("mark_sent_error").Inc()
 		slog.Error("failed to update timestamps for successful cron deliveries", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	if err := a.releaseCronClaims(allIDs); err != nil {
+		cronRunsTotal.WithLabelValues("release_claims_error").Inc()
 		slog.Error("failed to release cron claims after dispatch completion", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
+	cronRunsTotal.WithLabelValues("success").Inc()
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("Cron processing completed"))
 }
 func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	providedSecret := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
 	if a.webhookSecret != "" && !safeSecretCompare(providedSecret, a.webhookSecret) {
+		webhookUpdatesTotal.WithLabelValues("unauthorized").Inc()
 		slog.Warn("unauthorized webhook attempt blocked", "remote_ip", r.RemoteAddr)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
@@ -900,6 +986,7 @@ func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	var update tgbotapi.Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		webhookUpdatesTotal.WithLabelValues("bad_request").Inc()
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -908,9 +995,11 @@ func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// Якщо канал зайнятий на частки секунди, бот не поверне помилку 503 одразу, а дочекається вільного воркера.
 	select {
 	case a.telegramUpdateChan <- update:
+		webhookUpdatesTotal.WithLabelValues("accepted").Inc()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	case <-time.After(1 * time.Second):
+		webhookUpdatesTotal.WithLabelValues("dropped_queue_full").Inc()
 		slog.Warn(
 			"telegram incoming update channel queue full, dropping packet and backpressuring",
 			"update_id",
@@ -957,6 +1046,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 			if _, err := a.db.ExecContext(ctx, `INSERT INTO subscribers (chat_id, interval_minutes, last_sent, language_code, is_subscribed)
                      VALUES ($1, 60, NOW() - INTERVAL '2 minute', $2, FALSE)
                      ON CONFLICT (chat_id) DO UPDATE SET language_code = EXCLUDED.language_code`, chatID, newLang); err != nil {
+				dbOperationsTotal.WithLabelValues("set_language", "error").Inc()
 				slog.Error(
 					"failed to save language settings for user node",
 					"chat_id",
@@ -969,6 +1059,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 				return
 			}
 
+			dbOperationsTotal.WithLabelValues("set_language", "success").Inc()
 			a.langCache.Add(chatID, newLang)
 			_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "OK"))
 			a.sendSafeMessage(chatID, getMsgText(newLang, "lang_fixed"), nil)
@@ -994,6 +1085,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 
 			result, err := a.db.ExecContext(ctx, "UPDATE subscribers SET interval_minutes = $1, last_sent = NOW() WHERE chat_id = $2 AND is_subscribed = TRUE", minutes, chatID)
 			if err != nil {
+				dbOperationsTotal.WithLabelValues("update_interval", "error").Inc()
 				slog.Error(
 					"failed to update notification frequency interval",
 					"chat_id",
@@ -1008,6 +1100,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 
 			affectedRows, err := result.RowsAffected()
 			if err != nil {
+				dbOperationsTotal.WithLabelValues("update_interval", "error").Inc()
 				slog.Error(
 					"failed to inspect interval update result",
 					"chat_id",
@@ -1021,12 +1114,14 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 			}
 
 			if affectedRows == 0 {
+				dbOperationsTotal.WithLabelValues("update_interval", "inactive").Inc()
 				slog.Info("interval update rejected for inactive subscriber", "chat_id", chatID)
 				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, getMsgText(lang, "subscribe_first")))
 				a.sendSafeMessage(chatID, getMsgText(lang, "subscribe_first"), nil)
 				return
 			}
 
+			dbOperationsTotal.WithLabelValues("update_interval", "success").Inc()
 			unit := getMsgText(lang, "unit_m")
 			val := minutes
 			if minutes >= 60 {
@@ -1083,17 +1178,21 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
                      last_sent = COALESCE(subscribers.last_sent, EXCLUDED.last_sent),
                      language_code = EXCLUDED.language_code,
                      is_subscribed = TRUE`, chatID, lang); err != nil {
+			dbOperationsTotal.WithLabelValues("subscribe", "error").Inc()
 			slog.Error("subscriber activation failed", "chat_id", chatID, "error", err)
 			a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
 			return
 		}
+		dbOperationsTotal.WithLabelValues("subscribe", "success").Inc()
 		a.sendSafeMessage(chatID, getMsgText(lang, "subscribe"), nil)
 	case "unsubscribe":
 		if _, err := a.db.ExecContext(ctx, "UPDATE subscribers SET is_subscribed = FALSE, cron_claimed_until = NULL WHERE chat_id = $1", chatID); err != nil {
+			dbOperationsTotal.WithLabelValues("unsubscribe", "error").Inc()
 			slog.Error("deactivation sql command failed", "chat_id", chatID, "error", err)
 			a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
 			return
 		}
+		dbOperationsTotal.WithLabelValues("unsubscribe", "success").Inc()
 		a.sendSafeMessage(chatID, getMsgText(lang, "unsubscribe"), nil)
 	case "interval":
 		a.sendSafeMessage(chatID, getMsgText(lang, "interval_m"), getIntervalKeyboard(lang))
@@ -1177,7 +1276,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	tgBot, err := tgbotapi.NewBotAPI(isolatedBotToken)
+	telegramHTTPClient := &http.Client{Timeout: 10 * time.Second}
+	tgBot, err := tgbotapi.NewBotAPIWithClient(isolatedBotToken, tgbotapi.APIEndpoint, telegramHTTPClient)
 	if err != nil {
 		slog.Error("failed to initialize bot API", "error", err)
 		os.Exit(1)
@@ -1249,15 +1349,18 @@ func main() {
 		defer dbCheckCancel()
 
 		if err := app.db.PingContext(dbCheckCtx); err != nil {
+			dbOperationsTotal.WithLabelValues("readiness_ping", "error").Inc()
 			slog.Error("readiness check failed: database down", "error", err)
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("503 Service Unavailable: Database Unreachable"))
 			return
 		}
 
+		dbOperationsTotal.WithLabelValues("readiness_ping", "success").Inc()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Ready"))
 	}))
+	mux.HandleFunc("/metrics", methodMiddleware(http.MethodGet, promhttp.Handler().ServeHTTP))
 	mux.HandleFunc("/cron", methodMiddleware(http.MethodPost, app.producerMiddleware(app.rateLimitMiddleware(cronLimiter, app.handleCron))))
 	mux.HandleFunc("/webhook", methodMiddleware(http.MethodPost, app.producerMiddleware(app.rateLimitMiddleware(webhookLimiter, app.handleWebhook))))
 

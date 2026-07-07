@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Check formatting
+        run: test -z "$(find . -name '*.go' -not -path './vendor/*' -print0 | xargs -0 gofmt -l)"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Race test
+        run: go test -race ./...
+
+      - name: Govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          args: --timeout=5m --disable-all --enable=govet --enable=ineffassign --enable=staticcheck --enable=unused
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build image
+        run: docker build --pull -t eth-course-ci .
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Scan complete Git history
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.24.3
+        with:
+          args: git --redact --verbose --log-opts=--all .
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: /github/workspace

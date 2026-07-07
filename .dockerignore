@@ -1,9 +1,17 @@
 .git
+.github
 .env
 .env.*
 Dockerfile*
 *.log
 *.md
+*.exe
+*.test
+coverage.out
 bot
+build
+dist
+.vscode
+.idea
 .gitignore
 /tmp
