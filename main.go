@@ -20,6 +20,7 @@ import (
 
 	"log/slog"
 
+	// Сучасний драйвер pgx/v5 через stdlib-обгортку
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -28,6 +29,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// --- ТИПИ ДАНИХ І КЕШ ІЗ СИНХРОНІЗАЦІЄЮ ---
 
 type Subscriber struct {
 	ID   int64
@@ -98,6 +100,7 @@ type Job struct {
 	DoneFunc  func()
 }
 
+// --- СТРУКТУРА ЗАСТОСУНКУ (DEPENDENCY INJECTION) ---
 
 type App struct {
 	db                 *sql.DB
@@ -133,60 +136,64 @@ var allowedLanguages = map[string]bool{
 	"ru": true,
 }
 
+// --- СЛОВНИК ПЕРЕКЛАДІВ ---
 var messages = map[string]map[string]string{
 	"ua": {
-		"welcome":      "Вітаю! 🖖 Твій крипто-асистент уже на зв’язку! ⚡️\n\n🔹 Live-курси: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart-сповіщення: Обирай частоту (1 хв – 24 год).\n🔹 UAH-маркет: Курс USDT до гривні.\n\nТисни **/subscribe** для старту!",
-		"subscribe":    "✅ Підписка активована! Частота: 1 год. Змінити: /interval",
-		"unsubscribe":  "❌ Ви відписалися від розсилки. Налаштування мови збережено.",
-		"price_hdr":    "💰 *Актуальні курси:*",
-		"interval_m":   "⚙️ *Оберіть частоту повідомлень:*",
-		"interval_set": "✅ Тепер я буду надсилати курс кожні %d %s.",
-		"lang_sel":     "🌍 *Оберіть мову:*",
-		"lang_fixed":   "✅ Мову змінено на Українську!",
-		"updated":      "🕒 *Оновлено о %s (Київ)*",
-		"alert_hdr":    "🕒 *Планове оновлення (%s)*",
-		"dynamics":     "Динаміка цін за останні 15с",
-		"unit_m":       "хв",
-		"unit_h":       "год",
-		"btn_upd":      "🔄 Оновити",
-		"db_err":       "❌ Виникла технічна помилка при збереженні даних. Будь ласка, спробуйте пізніше.",
-		"no_data":      "немає даних",
+		"welcome":         "Вітаю! 🖖 Твій крипто-асистент уже на зв’язку! ⚡️\n\n🔹 Live-курси: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart-сповіщення: Обирай частоту (1 хв – 24 год).\n🔹 UAH-маркет: Курс USDT до гривні.\n\nТисни **/subscribe** для старту!",
+		"subscribe":       "✅ Підписка активована! Частота: 1 год. Змінити: /interval",
+		"subscribe_first": "⚠️ Спочатку активуйте підписку: /subscribe",
+		"unsubscribe":     "❌ Ви відписалися від розсилки. Налаштування мови збережено.",
+		"price_hdr":       "💰 *Актуальні курси:*",
+		"interval_m":      "⚙️ *Оберіть частоту повідомлень:*",
+		"interval_set":    "✅ Тепер я буду надсилати курс кожні %d %s.",
+		"lang_sel":        "🌍 *Оберіть мову:*",
+		"lang_fixed":      "✅ Мову змінено на Українську!",
+		"updated":         "🕒 *Оновлено о %s (Київ)*",
+		"alert_hdr":       "🕒 *Планове оновлення (%s)*",
+		"dynamics":        "Динаміка цін за останні 15с",
+		"unit_m":          "хв",
+		"unit_h":          "год",
+		"btn_upd":         "🔄 Оновити",
+		"db_err":          "❌ Виникла технічна помилка при збереженні даних. Будь ласка, спробуйте пізніше.",
+		"no_data":         "немає даних",
 	},
 	"en": {
-		"welcome":      "Welcome! 🖖 Your crypto assistant is online! ⚡️\n\n🔹 Live rates: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart alerts: Frequency (1 min – 24h).\n🔹 UAH market: USDT to UAH rate.\n\nPress **/subscribe** to start!",
-		"subscribe":    "✅ Subscription activated! Frequency: 1h. Change: /interval",
-		"unsubscribe":  "❌ You have unsubscribed. Language settings saved.",
-		"price_hdr":    "💰 *Current rates:*",
-		"interval_m":   "⚙️ *Choose alert frequency:*",
-		"interval_set": "✅ Now I will send the rates every %d %s.",
-		"lang_sel":     "🌍 *Select your language:*",
-		"lang_fixed":   "✅ Language changed to English!",
-		"updated":      "🕒 *Updated at %s (Kyiv)*",
-		"alert_hdr":    "🕒 *Scheduled update (%s)*",
-		"dynamics":     "Price dynamics (last 15s)",
-		"unit_m":       "min",
-		"unit_h":       "h",
-		"btn_upd":      "🔄 Update",
-		"db_err":       "❌ A technical error occurred while saving data. Please try again later.",
-		"no_data":      "no data available",
+		"welcome":         "Welcome! 🖖 Your crypto assistant is online! ⚡️\n\n🔹 Live rates: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart alerts: Frequency (1 min – 24h).\n🔹 UAH market: USDT to UAH rate.\n\nPress **/subscribe** to start!",
+		"subscribe":       "✅ Subscription activated! Frequency: 1h. Change: /interval",
+		"subscribe_first": "⚠️ Please subscribe first: /subscribe",
+		"unsubscribe":     "❌ You have unsubscribed. Language settings saved.",
+		"price_hdr":       "💰 *Current rates:*",
+		"interval_m":      "⚙️ *Choose alert frequency:*",
+		"interval_set":    "✅ Now I will send the rates every %d %s.",
+		"lang_sel":        "🌍 *Select your language:*",
+		"lang_fixed":      "✅ Language changed to English!",
+		"updated":         "🕒 *Updated at %s (Kyiv)*",
+		"alert_hdr":       "🕒 *Scheduled update (%s)*",
+		"dynamics":        "Price dynamics (last 15s)",
+		"unit_m":          "min",
+		"unit_h":          "h",
+		"btn_upd":         "🔄 Update",
+		"db_err":          "❌ A technical error occurred while saving data. Please try again later.",
+		"no_data":         "no data available",
 	},
 	"ru": {
-		"welcome":      "Привет! 🖖 Твой крипто-ассистент уже на связи! ⚡️\n\n🔹 Live-курсы: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart-уведомления: Частота (1 мин – 24 ч).\n🔹 UAH-маркет: Курс USDT к грывне.\n\nЖми **/subscribe** для старта!",
-		"subscribe":    "✅ Подписка активирована! Частота: 1 ч. Изменить: /interval",
-		"unsubscribe":  "❌ Вы отписались от рассылки. Настройки языка сохранены.",
-		"price_hdr":    "💰 *Актуальные курсы:*",
-		"interval_m":   "⚙️ *Выберите частоту уведомлений:*",
-		"interval_set": "✅ Теперь я буду присылать курс каждые %d %s.",
-		"lang_sel":     "🌍 *Выберите язык:*",
-		"lang_fixed":   "✅ Язык изменен на Русский!",
-		"updated":      "🕒 *Обновлено в %s (Киев)*",
-		"alert_hdr":    "🕒 *Плановое обновление (%s)*",
-		"dynamics":     "Динамика цен за последние 15с",
-		"unit_m":       "мин",
-		"unit_h":       "ч",
-		"btn_upd":      "🔄 Update",
-		"db_err":       "❌ Произошла техническая ошибка при сохранении данных. Пожалуйста, попробуйте позже.",
-		"no_data":      "нет данных",
+		"welcome":         "Привет! 🖖 Твой крипто-ассистент уже на связи! ⚡️\n\n🔹 Live-курсы: BTC, ETH, SOL, BNB, USDT.\n🔹 Smart-уведомления: Частота (1 мин – 24 ч).\n🔹 UAH-маркет: Курс USDT к грывне.\n\nЖми **/subscribe** для старта!",
+		"subscribe":       "✅ Подписка активирована! Частота: 1 ч. Изменить: /interval",
+		"subscribe_first": "⚠️ Сначала активируйте подписку: /subscribe",
+		"unsubscribe":     "❌ Вы отписались от рассылки. Настройки языка сохранены.",
+		"price_hdr":       "💰 *Актуальные курсы:*",
+		"interval_m":      "⚙️ *Выберите частоту уведомлений:*",
+		"interval_set":    "✅ Теперь я буду присылать курс каждые %d %s.",
+		"lang_sel":        "🌍 *Выберите язык:*",
+		"lang_fixed":      "✅ Язык изменен на Русский!",
+		"updated":         "🕒 *Обновлено в %s (Киев)*",
+		"alert_hdr":       "🕒 *Плановое обновление (%s)*",
+		"dynamics":        "Динамика цен за последние 15с",
+		"unit_m":          "мин",
+		"unit_h":          "ч",
+		"btn_upd":         "🔄 Update",
+		"db_err":          "❌ Произошла техническая ошибка при сохранении данных. Пожалуйста, попробуйте позже.",
+		"no_data":         "нет данных",
 	},
 }
 
@@ -202,6 +209,7 @@ func getMsgText(lang, key string) string {
 	return "⚠️ [Missing Translation]"
 }
 
+// --- БЕЗПЕЧНІ ОБГОРТКИ ДЛЯ TELEGRAM ---
 
 func (a *App) sendSafeMessage(chatID int64, text string, markup interface{}) {
 	msg := tgbotapi.NewMessage(chatID, text)
@@ -276,6 +284,7 @@ var langKeyboard = tgbotapi.NewInlineKeyboardMarkup(
 	),
 )
 
+// --- ФОНОВЕ ОПИТУВАННЯ BINANCE API ---
 
 func (a *App) startPriceTicker(ctx context.Context) {
 	ticker := time.NewTicker(15 * time.Second)
@@ -440,6 +449,7 @@ func (a *App) getLang(ctx context.Context, chatID int64) string {
 	return lang
 }
 
+// --- ПРОГРІВ КЕШУ З БД ---
 
 func (a *App) WarmupCache(ctx context.Context) {
 	pricesCtx, pricesCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -494,6 +504,7 @@ func (a *App) WarmupCache(ctx context.Context) {
 	)
 }
 
+// --- ДОВГОТРИВАЛИЙ ПУЛ ВОРКЕРІВ ДЛЯ CRON І TELEGRAM-ОНОВЛЕНЬ ---
 
 func (a *App) alertWorker(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -549,6 +560,7 @@ func (a *App) updateWorker(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
+// --- HTTP-ОБРОБНИКИ ТА MIDDLEWARE ---
 
 func methodMiddleware(method string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -892,6 +904,8 @@ func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ВИПРАВЛЕННЯ: Додано 1-секундний м'який таймаут очікування буфера.
+	// Якщо канал зайнятий на частки секунди, бот не поверне помилку 503 одразу, а дочекається вільного воркера.
 	select {
 	case a.telegramUpdateChan <- update:
 		w.WriteHeader(http.StatusOK)
@@ -966,6 +980,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 		if strings.HasPrefix(data, "int_") {
 			minutes, err := strconv.Atoi(data[4:])
 			if err != nil || minutes < 1 || minutes > 1440 {
+				// Передаємо створену групу як атрибут у метод Warn
 				slog.Warn("callback data validation failed",
 					slog.Group("security_alert",
 						slog.String("reason", "malicious_callback_range_violation"),
@@ -977,7 +992,8 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 				return
 			}
 
-			if _, err := a.db.ExecContext(ctx, "UPDATE subscribers SET interval_minutes = $1, last_sent = NOW() WHERE chat_id = $2", minutes, chatID); err != nil {
+			result, err := a.db.ExecContext(ctx, "UPDATE subscribers SET interval_minutes = $1, last_sent = NOW() WHERE chat_id = $2 AND is_subscribed = TRUE", minutes, chatID)
+			if err != nil {
 				slog.Error(
 					"failed to update notification frequency interval",
 					"chat_id",
@@ -987,6 +1003,27 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 				)
 				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Error"))
 				a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
+				return
+			}
+
+			affectedRows, err := result.RowsAffected()
+			if err != nil {
+				slog.Error(
+					"failed to inspect interval update result",
+					"chat_id",
+					chatID,
+					"error",
+					err,
+				)
+				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Error"))
+				a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
+				return
+			}
+
+			if affectedRows == 0 {
+				slog.Info("interval update rejected for inactive subscriber", "chat_id", chatID)
+				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, getMsgText(lang, "subscribe_first")))
+				a.sendSafeMessage(chatID, getMsgText(lang, "subscribe_first"), nil)
 				return
 			}
 
