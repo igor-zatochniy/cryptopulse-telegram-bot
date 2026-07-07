@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	"log/slog"
 
@@ -517,6 +518,28 @@ func (a *App) getLang(ctx context.Context, chatID int64) string {
 	return lang
 }
 
+func (a *App) isSubscribed(ctx context.Context, chatID int64) (bool, error) {
+	var subscribed bool
+	err := a.db.QueryRowContext(ctx, "SELECT is_subscribed FROM subscribers WHERE chat_id = $1", chatID).
+		Scan(&subscribed)
+	if errors.Is(err, sql.ErrNoRows) {
+		dbOperationsTotal.WithLabelValues("check_subscription", "not_found").Inc()
+		return false, nil
+	}
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("check_subscription", "error").Inc()
+		return false, err
+	}
+
+	if subscribed {
+		dbOperationsTotal.WithLabelValues("check_subscription", "active").Inc()
+	} else {
+		dbOperationsTotal.WithLabelValues("check_subscription", "inactive").Inc()
+	}
+
+	return subscribed, nil
+}
+
 // --- ПРОГРІВ КЕШУ З БД ---
 
 func (a *App) WarmupCache(ctx context.Context) {
@@ -767,13 +790,15 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() {
+		_ = tx.Rollback()
+	}()
 
 	rows, err := tx.QueryContext(dbCtx, `WITH due AS (
 		SELECT chat_id
 		FROM subscribers
 		WHERE is_subscribed = TRUE
-		AND COALESCE(last_sent, TIMESTAMP 'epoch') <= NOW() - (COALESCE(interval_minutes, 60) * INTERVAL '1 minute') + INTERVAL '59 second'
+		AND COALESCE(last_sent, TIMESTAMP 'epoch') <= NOW() - (COALESCE(interval_minutes, 60) * INTERVAL '1 minute')
 		AND (cron_claimed_until IS NULL OR cron_claimed_until < NOW())
 		ORDER BY last_sent ASC NULLS FIRST
 		LIMIT $1
@@ -973,6 +998,25 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("Cron processing completed"))
 }
+
+func (a *App) metricsAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		var providedToken string
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			providedToken = authHeader[7:]
+		}
+
+		if !safeSecretCompare(providedToken, a.cronSecret) {
+			slog.Warn("unauthorized metrics endpoint access blocked", "remote_ip", r.RemoteAddr)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	providedSecret := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
 	if a.webhookSecret != "" && !safeSecretCompare(providedSecret, a.webhookSecret) {
@@ -1195,6 +1239,17 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 		dbOperationsTotal.WithLabelValues("unsubscribe", "success").Inc()
 		a.sendSafeMessage(chatID, getMsgText(lang, "unsubscribe"), nil)
 	case "interval":
+		subscribed, err := a.isSubscribed(ctx, chatID)
+		if err != nil {
+			slog.Error("failed to check subscription status before interval menu", "chat_id", chatID, "error", err)
+			a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
+			return
+		}
+		if !subscribed {
+			a.sendSafeMessage(chatID, getMsgText(lang, "subscribe_first"), nil)
+			return
+		}
+
 		a.sendSafeMessage(chatID, getMsgText(lang, "interval_m"), getIntervalKeyboard(lang))
 	case "price":
 		prices := a.getFormattedPricesFromCache(lang)
@@ -1360,7 +1415,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Ready"))
 	}))
-	mux.HandleFunc("/metrics", methodMiddleware(http.MethodGet, promhttp.Handler().ServeHTTP))
+	mux.HandleFunc("/metrics", methodMiddleware(http.MethodGet, app.metricsAuthMiddleware(promhttp.Handler().ServeHTTP)))
 	mux.HandleFunc("/cron", methodMiddleware(http.MethodPost, app.producerMiddleware(app.rateLimitMiddleware(cronLimiter, app.handleCron))))
 	mux.HandleFunc("/webhook", methodMiddleware(http.MethodPost, app.producerMiddleware(app.rateLimitMiddleware(webhookLimiter, app.handleWebhook))))
 
