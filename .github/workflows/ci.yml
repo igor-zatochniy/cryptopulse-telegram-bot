@@ -26,7 +26,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.11"
+          go-version: "1.25.12"
           cache: true
 
       - name: Download modules
@@ -45,7 +45,7 @@ jobs:
         run: go test -race ./...
 
       - name: Govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
 
   lint:
     name: golangci-lint
@@ -58,13 +58,33 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.11"
+          go-version: "1.25.12"
           cache: true
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          args: --timeout=5m --disable-all --enable=govet --enable=ineffassign --enable=staticcheck --enable=unused
+          version: v2.12.0
+
+  integration:
+    name: postgres integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.12"
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Run PostgreSQL integration tests
+        run: go test -tags=integration ./...
 
   docker:
     name: docker build

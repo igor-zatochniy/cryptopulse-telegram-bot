@@ -689,6 +689,7 @@ func (a *App) rateLimitMiddleware(limiter *rate.Limiter, next http.HandlerFunc) 
 
 func (a *App) producerMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Рахуємо активні HTTP producer-и, щоб під час shutdown не закрити канали під живим handler.
 		a.producerMu.Lock()
 		if a.shuttingDown {
 			a.producerMu.Unlock()
@@ -729,10 +730,12 @@ func safeSecretCompare(inputToken, expectedSecret string) bool {
 	if expectedSecret == "" {
 		return false
 	}
+	// Порівнюємо секрети у сталий час, щоб не відкривати timing side-channel.
 	return subtle.ConstantTimeCompare([]byte(inputToken), []byte(expectedSecret)) == 1
 }
 
 func isPermanentTelegramSendError(err error) bool {
+	// Постійні Telegram-помилки означають, що користувач недоступний і його треба відписати від cron-розсилки.
 	var tgErr *tgbotapi.Error
 	if errors.As(err, &tgErr) {
 		msg := strings.ToLower(tgErr.Message)
@@ -794,6 +797,7 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 		_ = tx.Rollback()
 	}()
 
+	// У короткій транзакції позначаємо batch у БД і одразу фіксуємо зміни, щоб не тримати row locks під час Telegram API calls.
 	rows, err := tx.QueryContext(dbCtx, `WITH due AS (
 		SELECT chat_id
 		FROM subscribers
@@ -849,6 +853,7 @@ func (a *App) markCronDeliveriesSent(ids []int64) error {
 		return nil
 	}
 
+	// last_sent оновлюється тільки для реально доставлених повідомлень.
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer dbCancel()
 
@@ -871,6 +876,7 @@ func (a *App) releaseCronClaims(ids []int64) error {
 		return nil
 	}
 
+	// Звільняємо claim-и після batch: тимчасові помилки залишають користувача eligible для наступної спроби.
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer dbCancel()
 
@@ -942,6 +948,7 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	collector := &SafeIDCollector{ids: make([]int64, 0, len(subs))}
 	var dispatchWG sync.WaitGroup
 
+	// Handler чекає завершення вже поставлених jobs, щоб не відповісти cron-у до фіксації результатів у БД.
 	for _, s := range subs {
 		pricesTextLocal := a.getFormattedPricesFromCache(s.Lang)
 		header := fmt.Sprintf(getMsgText(s.Lang, "alert_hdr"), currentTime)
@@ -1307,7 +1314,13 @@ func main() {
 		},
 	}
 
-	rawDB, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		slog.Error("configuration error: DATABASE_URL missing")
+		os.Exit(1)
+	}
+
+	rawDB, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		slog.Error("failed to initialize connection pool", "error", err)
 		os.Exit(1)
@@ -1444,6 +1457,7 @@ func main() {
 	<-runCtx.Done()
 	slog.Info("shutdown signal intercepted")
 
+	// Спочатку забороняємо нові producer-и, потім drain-имо активні handler-и і лише після цього закриваємо канали.
 	app.stopAcceptingProducers()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)

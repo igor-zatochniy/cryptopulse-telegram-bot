@@ -2,7 +2,6 @@
 .github
 .env
 .env.*
-Dockerfile*
 *.log
 *.md
 *.exe
