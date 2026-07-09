@@ -36,8 +36,9 @@ import (
 // --- ТИПИ ДАНИХ І КЕШ ІЗ СИНХРОНІЗАЦІЄЮ ---
 
 type Subscriber struct {
-	ID   int64
-	Lang string
+	ID        int64
+	Lang      string
+	ClaimedAt time.Time
 }
 
 type PriceEntry struct {
@@ -798,21 +799,25 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 	}()
 
 	// У короткій транзакції позначаємо batch у БД і одразу фіксуємо зміни, щоб не тримати row locks під час Telegram API calls.
-	rows, err := tx.QueryContext(dbCtx, `WITH due AS (
-		SELECT chat_id
-		FROM subscribers
-		WHERE is_subscribed = TRUE
-		AND COALESCE(last_sent, TIMESTAMP 'epoch') <= NOW() - (COALESCE(interval_minutes, 60) * INTERVAL '1 minute')
-		AND (cron_claimed_until IS NULL OR cron_claimed_until < NOW())
-		ORDER BY last_sent ASC NULLS FIRST
+	// Cron приходить раз на календарну хвилину, тому due-check і last_sent працюють хвилинними слотами, а не рівно 60 секундами.
+	rows, err := tx.QueryContext(dbCtx, `WITH claim_clock AS (
+		SELECT NOW() AS claimed_at
+	), due AS (
+		SELECT s.chat_id
+		FROM subscribers AS s
+		CROSS JOIN claim_clock
+		WHERE s.is_subscribed = TRUE
+		AND date_trunc('minute', COALESCE(s.last_sent, TIMESTAMPTZ 'epoch')) <= date_trunc('minute', claim_clock.claimed_at) - (COALESCE(s.interval_minutes, 60) * INTERVAL '1 minute')
+		AND (s.cron_claimed_until IS NULL OR s.cron_claimed_until < claim_clock.claimed_at)
+		ORDER BY s.last_sent ASC NULLS FIRST
 		LIMIT $1
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE OF s SKIP LOCKED
 	)
 	UPDATE subscribers AS s
-	SET cron_claimed_until = NOW() + INTERVAL '2 minute'
-	FROM due
+	SET cron_claimed_until = claim_clock.claimed_at + INTERVAL '2 minute'
+	FROM due, claim_clock
 	WHERE s.chat_id = due.chat_id
-	RETURNING s.chat_id, COALESCE(s.language_code, 'ua')`, cronBatchLimit)
+	RETURNING s.chat_id, COALESCE(s.language_code, 'ua'), claim_clock.claimed_at`, cronBatchLimit)
 	if err != nil {
 		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 		return nil, err
@@ -821,7 +826,7 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 	var subs []Subscriber
 	for rows.Next() {
 		var sub Subscriber
-		if err := rows.Scan(&sub.ID, &sub.Lang); err != nil {
+		if err := rows.Scan(&sub.ID, &sub.Lang, &sub.ClaimedAt); err != nil {
 			_ = rows.Close()
 			dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
 			return nil, err
@@ -848,7 +853,7 @@ func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
 	return subs, nil
 }
 
-func (a *App) markCronDeliveriesSent(ids []int64) error {
+func (a *App) markCronDeliveriesSent(ids []int64, sentAt time.Time) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -859,8 +864,9 @@ func (a *App) markCronDeliveriesSent(ids []int64) error {
 
 	_, err := a.db.ExecContext(
 		dbCtx,
-		"UPDATE subscribers SET last_sent = NOW(), cron_claimed_until = NULL WHERE chat_id = ANY($1)",
+		"UPDATE subscribers SET last_sent = date_trunc('minute', $2::timestamptz), cron_claimed_until = NULL WHERE chat_id = ANY($1)",
 		any(ids),
+		sentAt,
 	)
 	if err != nil {
 		dbOperationsTotal.WithLabelValues("mark_cron_sent", "error").Inc()
@@ -987,7 +993,7 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	slog.Info("all cron dispatch batch routines reported completion tasks successfully")
 
 	successIDs := collector.FlushIDs()
-	if err := a.markCronDeliveriesSent(successIDs); err != nil {
+	if err := a.markCronDeliveriesSent(successIDs, subs[0].ClaimedAt); err != nil {
 		cronRunsTotal.WithLabelValues("mark_sent_error").Inc()
 		slog.Error("failed to update timestamps for successful cron deliveries", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)

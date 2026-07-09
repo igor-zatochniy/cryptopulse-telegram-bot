@@ -371,6 +371,41 @@ func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
 	assertSubscribed(t, db, 303, false)
 }
 
+func TestIntegrationCronRecordsClaimMinuteAsLastSent(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 304
+	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
+	insertSubscriber(t, db, chatID, true, 1, "ua", oldLastSent)
+
+	subs, err := app.claimDueSubscribers(context.Background())
+	if err != nil {
+		t.Fatalf("claim due subscribers: %v", err)
+	}
+	if len(subs) != 1 {
+		t.Fatalf("claimed subscribers = %d, want 1", len(subs))
+	}
+	if subs[0].ID != chatID {
+		t.Fatalf("claimed chat id = %d, want %d", subs[0].ID, chatID)
+	}
+	if subs[0].ClaimedAt.IsZero() {
+		t.Fatal("claimed_at is zero")
+	}
+
+	if err := app.markCronDeliveriesSent([]int64{chatID}, subs[0].ClaimedAt); err != nil {
+		t.Fatalf("mark cron delivery sent: %v", err)
+	}
+
+	lastSent := selectLastSent(t, db, chatID)
+	expectedLastSent := subs[0].ClaimedAt.Truncate(time.Minute)
+	if lastSent.Sub(expectedLastSent).Abs() > time.Second {
+		t.Fatalf("last_sent = %s, want close to claimed minute %s", lastSent, expectedLastSent)
+	}
+	assertClaimCleared(t, db, chatID)
+}
+
 func insertSubscriber(t *testing.T, db *sql.DB, chatID int64, subscribed bool, interval int, lang string, lastSent time.Time) {
 	t.Helper()
 
