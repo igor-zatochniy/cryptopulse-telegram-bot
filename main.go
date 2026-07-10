@@ -140,48 +140,48 @@ const cronBatchLimit = 100
 var (
 	cronRunsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "eth_course_cron_runs_total",
+			Name: "cryptopulse_cron_runs_total",
 			Help: "Total number of cron endpoint executions by result status.",
 		},
 		[]string{"status"},
 	)
 	cronClaimedSubscribersTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
-			Name: "eth_course_cron_claimed_subscribers_total",
+			Name: "cryptopulse_cron_claimed_subscribers_total",
 			Help: "Total number of subscribers claimed by cron batches.",
 		},
 	)
 	cronDeliveriesTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "eth_course_cron_deliveries_total",
+			Name: "cryptopulse_cron_deliveries_total",
 			Help: "Total number of scheduled Telegram delivery attempts by result status.",
 		},
 		[]string{"status"},
 	)
 	webhookUpdatesTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "eth_course_webhook_updates_total",
+			Name: "cryptopulse_webhook_updates_total",
 			Help: "Total number of Telegram webhook updates by result status.",
 		},
 		[]string{"status"},
 	)
 	telegramSendErrorsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "eth_course_telegram_send_errors_total",
+			Name: "cryptopulse_telegram_send_errors_total",
 			Help: "Total number of Telegram send/edit errors by type.",
 		},
 		[]string{"type"},
 	)
 	binanceRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "eth_course_binance_requests_total",
+			Name: "cryptopulse_binance_requests_total",
 			Help: "Total number of Binance ticker requests by symbol and result status.",
 		},
 		[]string{"symbol", "status"},
 	)
 	dbOperationsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "eth_course_db_operations_total",
+			Name: "cryptopulse_db_operations_total",
 			Help: "Total number of database operations by operation name and result status.",
 		},
 		[]string{"operation", "status"},

@@ -1,4 +1,4 @@
-module eth-bot
+module github.com/igor-zatochniy/cryptopulse-telegram-bot
 
 go 1.25.0
 

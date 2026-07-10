@@ -1,6 +1,6 @@
 # Operations Runbook
 
-Цей документ описує базову експлуатацію ETH Course Crypto Telegram Bot у production-середовищі.
+Цей документ описує базову експлуатацію CryptoPulse Telegram Bot у production-середовищі.
 
 Мета runbook: швидко зрозуміти, як безпечно деплоїти сервіс, перевіряти його стан, захищати PostgreSQL, робити backup/restore і діяти під час інцидентів.
 
@@ -35,6 +35,7 @@ Hetzner PostgreSQL
 <service-domain>             Koyeb domain застосунку
 <hetzner_server_ip>          IPv4 адреса сервера з PostgreSQL
 <current_koyeb_egress_ip>    поточний outbound IP Koyeb, який бачить PostgreSQL
+<database_name>              назва production-бази PostgreSQL
 <backup_file>                шлях до backup-файлу PostgreSQL
 ```
 
@@ -78,15 +79,15 @@ psql "$DATABASE_URL" -f migrations/001_init_schema.sql
 На сервері Hetzner можна виконати від імені PostgreSQL admin:
 
 ```bash
-sudo -u postgres psql -d ethbot -f /path/to/migrations/001_init_schema.sql
+sudo -u postgres psql -d <database_name> -f /path/to/migrations/001_init_schema.sql
 ```
 
 Після міграції перевірте ключові таблиці:
 
 ```bash
-sudo -u postgres psql -d ethbot -c "\dt"
-sudo -u postgres psql -d ethbot -c "\d subscribers"
-sudo -u postgres psql -d ethbot -c "\d market_prices"
+sudo -u postgres psql -d <database_name> -c "\dt"
+sudo -u postgres psql -d <database_name> -c "\d subscribers"
+sudo -u postgres psql -d <database_name> -c "\d market_prices"
 ```
 
 ## PostgreSQL Firewall
@@ -114,7 +115,7 @@ sudo ss -tulpn | grep ':5432'
 Перевірити активні PostgreSQL connections:
 
 ```bash
-sudo -u postgres psql -d ethbot -c "SELECT client_addr, usename, application_name, state, count(*) FROM pg_stat_activity WHERE datname='ethbot' GROUP BY client_addr, usename, application_name, state ORDER BY count(*) DESC;"
+sudo -u postgres psql -d <database_name> -c "SELECT client_addr, usename, application_name, state, count(*) FROM pg_stat_activity WHERE datname='<database_name>' GROUP BY client_addr, usename, application_name, state ORDER BY count(*) DESC;"
 ```
 
 Приклад iptables hardening для поточного Koyeb egress IP:
@@ -149,7 +150,7 @@ sudo netfilter-persistent reload
 
 ```bash
 sudo mkdir -p /root/backups
-sudo -u postgres pg_dump -Fc -d ethbot -f /root/backups/ethbot_YYYYMMDD_HHMM.dump
+sudo -u postgres pg_dump -Fc -d <database_name> -f /root/backups/cryptopulse_YYYYMMDD_HHMM.dump
 ```
 
 Перевірити, що backup створився:
@@ -172,14 +173,14 @@ sudo ls -lh /root/backups
 Приклад restore у наявну базу:
 
 ```bash
-sudo -u postgres pg_restore --clean --if-exists -d ethbot /root/backups/<backup_file>
+sudo -u postgres pg_restore --clean --if-exists -d <database_name> /root/backups/<backup_file>
 ```
 
 Після restore:
 
 ```bash
-sudo -u postgres psql -d ethbot -c "SELECT COUNT(*) FROM subscribers;"
-sudo -u postgres psql -d ethbot -c "SELECT COUNT(*) FROM market_prices;"
+sudo -u postgres psql -d <database_name> -c "SELECT COUNT(*) FROM subscribers;"
+sudo -u postgres psql -d <database_name> -c "SELECT COUNT(*) FROM market_prices;"
 ```
 
 ## Health Checks
@@ -248,12 +249,12 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 
 Корисні метрики:
 
-- `eth_course_cron_runs_total`
-- `eth_course_cron_claimed_subscribers_total`
-- `eth_course_cron_deliveries_total`
-- `eth_course_webhook_updates_total`
-- `eth_course_telegram_send_errors_total`
-- `eth_course_binance_requests_total`
+- `cryptopulse_cron_runs_total`
+- `cryptopulse_cron_claimed_subscribers_total`
+- `cryptopulse_cron_deliveries_total`
+- `cryptopulse_webhook_updates_total`
+- `cryptopulse_telegram_send_errors_total`
+- `cryptopulse_binance_requests_total`
 
 На що дивитися:
 
@@ -298,15 +299,15 @@ Authorization: Bearer <CRON_SECRET>
 4. Перевірити `/metrics`:
 
 ```text
-eth_course_cron_runs_total
-eth_course_cron_deliveries_total
-eth_course_telegram_send_errors_total
+cryptopulse_cron_runs_total
+cryptopulse_cron_deliveries_total
+cryptopulse_telegram_send_errors_total
 ```
 
 5. Перевірити subscribers:
 
 ```bash
-sudo -u postgres psql -d ethbot -c "SELECT chat_id, interval_minutes, last_sent, is_subscribed, cron_claimed_until FROM subscribers ORDER BY last_sent ASC LIMIT 20;"
+sudo -u postgres psql -d <database_name> -c "SELECT chat_id, interval_minutes, last_sent, is_subscribed, cron_claimed_until FROM subscribers ORDER BY last_sent ASC LIMIT 20;"
 ```
 
 ### Telegram Webhook Does Not Work
@@ -327,13 +328,13 @@ https://<service-domain>/webhook
 2. Перевірити metrics:
 
 ```text
-eth_course_binance_requests_total
+cryptopulse_binance_requests_total
 ```
 
 3. Перевірити DB cache:
 
 ```bash
-sudo -u postgres psql -d ethbot -c "SELECT symbol, price, updated_at FROM market_prices ORDER BY symbol;"
+sudo -u postgres psql -d <database_name> -c "SELECT symbol, price, updated_at FROM market_prices ORDER BY symbol;"
 ```
 
 ### Suspected Public PostgreSQL Exposure

@@ -1,8 +1,8 @@
-# ETH Course Crypto Telegram Bot
+# CryptoPulse Telegram Bot
 
-[![CI](https://github.com/igor-zatochniy/eth-course/actions/workflows/ci.yml/badge.svg)](https://github.com/igor-zatochniy/eth-course/actions/workflows/ci.yml)
+[![CI](https://github.com/igor-zatochniy/cryptopulse-telegram-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/igor-zatochniy/cryptopulse-telegram-bot/actions/workflows/ci.yml)
 
-Telegram-бот production-рівня, написаний на Go. Він відстежує ціни криптовалют, зберігає налаштування підписників у PostgreSQL, надсилає заплановані Telegram-сповіщення, має health/readiness endpoints і постачається як посилений Docker-образ.
+Production-орієнтований Telegram-сервіс на Go. Він відстежує ціни криптовалют, зберігає налаштування підписників у PostgreSQL, надсилає заплановані Telegram-сповіщення, має health/readiness endpoints і постачається як посилений Docker-образ.
 
 Проєкт навмисно компактний, але побудований як реальний сервіс: міграції бази даних, graceful shutdown, CI-перевірки, Prometheus-метрики, rate limits, Docker hardening і явна обробка операційних помилок.
 
@@ -56,6 +56,7 @@ flowchart LR
 ├── main_test.go                  # Regression tests для middleware/auth behavior
 ├── .golangci.yml                 # Конфігурація golangci-lint v2
 ├── .env.example                  # Безпечний шаблон environment variables
+├── LICENSE                       # MIT license
 ├── .dockerignore
 ├── .gitignore
 ├── go.mod
@@ -127,13 +128,13 @@ go run .
 Зберіть production image:
 
 ```bash
-docker build -t eth-course .
+docker build -t cryptopulse-telegram-bot .
 ```
 
 Запустіть його:
 
 ```bash
-docker run --rm -p 8080:8080 --env-file .env eth-course
+docker run --rm -p 8080:8080 --env-file .env cryptopulse-telegram-bot
 ```
 
 Фінальний образ використовує:
@@ -212,9 +213,9 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 - Worker pools зупиняються через context cancellation і channel draining.
 - HTTP producers відстежуються через `WaitGroup` під час shutdown.
 
-## Акценти Для Портфоліо
+## Ключові Інженерні Рішення
 
-Цей проєкт демонструє:
+У проєкті реалізовано:
 
 - production-oriented Go service design у компактному коді
 - PostgreSQL schema hardening і migration discipline
@@ -225,4 +226,4 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 
 ## Ліцензія
 
-Файл ліцензії наразі не додано. Додайте його перед повторним використанням або публічним розповсюдженням проєкту.
+Проєкт поширюється за ліцензією MIT. Дивіться [LICENSE](LICENSE).

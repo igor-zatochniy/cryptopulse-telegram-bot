@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	integrationDBName   = "ethbot"
-	integrationDBUser   = "ethbot_user"
+	integrationDBName   = "cryptopulse"
+	integrationDBUser   = "cryptopulse_user"
 	integrationDBPass   = "integration_password"
 	integrationBotToken = "integration-token"
 )
