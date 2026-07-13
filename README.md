@@ -1,10 +1,48 @@
 # CryptoPulse Telegram Bot
 
 [![CI](https://github.com/igor-zatochniy/cryptopulse-telegram-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/igor-zatochniy/cryptopulse-telegram-bot/actions/workflows/ci.yml)
+[![Telegram Bot](https://img.shields.io/badge/Telegram-Live%20Bot-2CA5E0?logo=telegram)](https://t.me/btc_eth_usdt_bot)
 
 Production-орієнтований Telegram-сервіс на Go. Він відстежує ціни криптовалют, зберігає налаштування підписників у PostgreSQL, надсилає заплановані Telegram-сповіщення, має health/readiness endpoints і постачається як посилений Docker-образ.
 
 Проєкт навмисно компактний, але побудований як реальний сервіс: міграції бази даних, graceful shutdown, CI-перевірки, Prometheus-метрики, rate limits, Docker hardening і явна обробка операційних помилок.
+
+## Спробувати бота
+
+Відкрийте CryptoPulse у Telegram:
+
+[**Запустити @btc_eth_usdt_bot**](https://t.me/btc_eth_usdt_bot)
+
+Після відкриття натисніть **Start** або надішліть команду:
+
+```text
+/start
+```
+
+## Demo
+
+![CryptoPulse: запуск бота, актуальні ціни та вибір інтервалу](docs/images/bot-demo-start.png)
+
+![CryptoPulse: планове оновлення, вибір мови та відписка](docs/images/bot-demo-alerts.png)
+
+## Основні команди
+
+| Команда | Призначення |
+| --- | --- |
+| `/start` | Запустити бота та переглянути вступне повідомлення |
+| `/subscribe` | Увімкнути регулярні сповіщення |
+| `/unsubscribe` | Вимкнути регулярні сповіщення |
+| `/price` | Отримати актуальні ціни криптовалют |
+| `/interval` | Змінити інтервал сповіщень |
+| `/language` | Вибрати мову повідомлень |
+
+## Deployment
+
+- **Status:** Live
+- **Platform:** Koyeb
+- **Bot:** [@btc_eth_usdt_bot](https://t.me/btc_eth_usdt_bot)
+- **Runtime:** Distroless Docker image, non-root
+- **Health checks:** `/live` and `/ready`
 
 ## Можливості
 
