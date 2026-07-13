@@ -306,6 +306,11 @@ func (a *App) editSafeMessage(
 	}
 }
 
+// Підтверджує callback без тексту, щоб Telegram закрив індикатор завантаження без спливного повідомлення.
+func (a *App) acknowledgeCallback(callbackID string) {
+	_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, ""))
+}
+
 func getRefreshKeyboard(lang string) *tgbotapi.InlineKeyboardMarkup {
 	text := getMsgText(lang, "btn_upd")
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -1118,7 +1123,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 
 			dbOperationsTotal.WithLabelValues("set_language", "success").Inc()
 			a.langCache.Add(chatID, newLang)
-			_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "OK"))
+			a.acknowledgeCallback(callbackID)
 			a.sendSafeMessage(chatID, getMsgText(newLang, "lang_fixed"), nil)
 			return
 		}
@@ -1185,7 +1190,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 				unit = getMsgText(lang, "unit_h")
 				val = minutes / 60
 			}
-			_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "OK"))
+			a.acknowledgeCallback(callbackID)
 			a.sendSafeMessage(chatID, fmt.Sprintf(getMsgText(lang, "interval_set"), val, unit), nil)
 			return
 		}
@@ -1206,7 +1211,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 				text,
 				getRefreshKeyboard(lang),
 			)
-			_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "OK"))
+			a.acknowledgeCallback(callbackID)
 		}
 		return
 	}
