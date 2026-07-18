@@ -213,16 +213,16 @@ func newIntegrationApp(t *testing.T, db *sql.DB, bot *tgbotapi.BotAPI) *App {
 	}
 
 	app := &App{
-		db:                 db,
-		bot:                bot,
-		priceCache:         &PriceCache{store: make(map[string]PriceEntry)},
-		langCache:          cache,
-		telegramUpdateChan: make(chan tgbotapi.Update, 100),
-		cronJobChan:        make(chan Job, 100),
-		kyivLoc:            time.UTC,
-		httpClient:         http.DefaultClient,
-		webhookSecret:      "webhook-secret",
-		cronSecret:         "cron-secret",
+		db:                   db,
+		bot:                  bot,
+		priceCache:           &PriceCache{store: make(map[string]PriceEntry)},
+		langCache:            cache,
+		telegramUpdateShards: newTelegramUpdateShards(telegramShardCount, telegramShardBuffer),
+		cronJobChan:          make(chan Job, 100),
+		kyivLoc:              time.UTC,
+		httpClient:           http.DefaultClient,
+		webhookSecret:        "webhook-secret",
+		cronSecret:           "cron-secret",
 	}
 
 	for _, coin := range trackedCoins {
@@ -239,7 +239,7 @@ func TestIntegrationSubscribeAfterLanguageSelection(t *testing.T) {
 
 	const chatID int64 = 101
 
-	app.processTelegramUpdate(tgbotapi.Update{
+	app.processTelegramUpdate(context.Background(), tgbotapi.Update{
 		CallbackQuery: &tgbotapi.CallbackQuery{
 			ID:   "set-language",
 			Data: "setlang_en",
@@ -251,7 +251,7 @@ func TestIntegrationSubscribeAfterLanguageSelection(t *testing.T) {
 
 	assertSubscriberState(t, db, chatID, false, 60, "en")
 
-	app.processTelegramUpdate(tgbotapi.Update{
+	app.processTelegramUpdate(context.Background(), tgbotapi.Update{
 		Message: &tgbotapi.Message{
 			Text: "/subscribe",
 			Chat: &tgbotapi.Chat{ID: chatID},
@@ -272,7 +272,7 @@ func TestIntegrationIntervalRequiresSubscriptionAndUpdatesSubscribedUser(t *test
 
 	const inactiveChatID int64 = 201
 
-	app.processTelegramUpdate(tgbotapi.Update{
+	app.processTelegramUpdate(context.Background(), tgbotapi.Update{
 		Message: &tgbotapi.Message{
 			Text: "/interval",
 			Chat: &tgbotapi.Chat{ID: inactiveChatID},
@@ -288,7 +288,7 @@ func TestIntegrationIntervalRequiresSubscriptionAndUpdatesSubscribedUser(t *test
 	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
 	insertSubscriber(t, db, activeChatID, true, 60, "ua", oldLastSent)
 
-	app.processTelegramUpdate(tgbotapi.Update{
+	app.processTelegramUpdate(context.Background(), tgbotapi.Update{
 		CallbackQuery: &tgbotapi.CallbackQuery{
 			ID:   "set-interval",
 			Data: "int_5",
@@ -307,6 +307,64 @@ func TestIntegrationIntervalRequiresSubscriptionAndUpdatesSubscribedUser(t *test
 	if !newLastSent.After(oldLastSent) {
 		t.Fatalf("last_sent was not advanced: got %s, old %s", newLastSent, oldLastSent)
 	}
+}
+
+func TestIntegrationTelegramWorkersPreserveSameChatOrder(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 306
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var once sync.Once
+
+	app.beforeTelegramUpdate = func(ctx context.Context, update tgbotapi.Update) {
+		if update.Message == nil || update.Message.Text != "/subscribe" {
+			return
+		}
+
+		once.Do(func() {
+			close(firstStarted)
+		})
+
+		select {
+		case <-releaseFirst:
+		case <-ctx.Done():
+		}
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	var workerWG sync.WaitGroup
+	for _, updates := range app.telegramUpdateShards {
+		workerWG.Add(1)
+		go app.updateWorker(runCtx, &workerWG, updates)
+	}
+	t.Cleanup(func() {
+		cancel()
+		for _, updates := range app.telegramUpdateShards {
+			close(updates)
+		}
+		workerWG.Wait()
+	})
+
+	if !app.enqueueTelegramUpdate(context.Background(), commandUpdate(chatID, "/subscribe")) {
+		t.Fatal("enqueue subscribe update")
+	}
+
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe update did not start")
+	}
+
+	if !app.enqueueTelegramUpdate(context.Background(), commandUpdate(chatID, "/unsubscribe")) {
+		t.Fatal("enqueue unsubscribe update")
+	}
+
+	close(releaseFirst)
+	waitForSubscribed(t, db, chatID, false)
 }
 
 func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
@@ -354,9 +412,10 @@ func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
 
 	app.handleCron(rec, req)
 
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("cron status = %d, body = %q", rec.Code, rec.Body.String())
 	}
+	app.cronBatchWG.Wait()
 
 	assertLastSentAdvanced(t, db, 301, oldLastSent)
 	assertClaimCleared(t, db, 301)
@@ -369,6 +428,65 @@ func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
 	assertLastSentUnchanged(t, db, 303, oldLastSent)
 	assertClaimCleared(t, db, 303)
 	assertSubscribed(t, db, 303, false)
+}
+
+func TestIntegrationCronReturnsBeforeTelegramDeliveryCompletes(t *testing.T) {
+	db := setupIntegrationDB(t)
+	sendStarted := make(chan struct{})
+	releaseSend := make(chan struct{})
+	var once sync.Once
+
+	bot := newFakeTelegramBot(t, func(chatID int64) fakeTelegramResponse {
+		once.Do(func() {
+			close(sendStarted)
+		})
+		<-releaseSend
+		return fakeTelegramResponse{OK: true}
+	})
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 305
+	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
+	insertSubscriber(t, db, chatID, true, 1, "ua", oldLastSent)
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	var workerWG sync.WaitGroup
+	workerWG.Add(1)
+	go app.alertWorker(runCtx, &workerWG)
+	t.Cleanup(func() {
+		cancel()
+		close(app.cronJobChan)
+		workerWG.Wait()
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/cron", nil)
+	req.Header.Set("Authorization", "Bearer cron-secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan int, 1)
+	go func() {
+		app.handleCron(rec, req)
+		done <- rec.Code
+	}()
+
+	select {
+	case code := <-done:
+		if code != http.StatusAccepted {
+			t.Fatalf("cron status = %d, body = %q", code, rec.Body.String())
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("cron handler waited for Telegram delivery")
+	}
+
+	select {
+	case <-sendStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("telegram delivery did not start")
+	}
+
+	close(releaseSend)
+	app.cronBatchWG.Wait()
+	assertLastSentAdvanced(t, db, chatID, oldLastSent)
 }
 
 func TestIntegrationCronRecordsClaimMinuteAsLastSent(t *testing.T) {
@@ -420,6 +538,43 @@ func insertSubscriber(t *testing.T, db *sql.DB, chatID int64, subscribed bool, i
 	)
 	if err != nil {
 		t.Fatalf("insert subscriber %d: %v", chatID, err)
+	}
+}
+
+func commandUpdate(chatID int64, command string) tgbotapi.Update {
+	return tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Text: command,
+			Chat: &tgbotapi.Chat{ID: chatID},
+			Entities: []tgbotapi.MessageEntity{
+				{Type: "bot_command", Offset: 0, Length: len(command)},
+			},
+		},
+	}
+}
+
+func waitForSubscribed(t *testing.T, db *sql.DB, chatID int64, want bool) {
+	t.Helper()
+
+	deadline := time.After(5 * time.Second)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		var got bool
+		err := db.QueryRow("SELECT is_subscribed FROM subscribers WHERE chat_id = $1", chatID).Scan(&got)
+		if err == nil && got == want {
+			return
+		}
+
+		select {
+		case <-deadline:
+			if err != nil {
+				t.Fatalf("subscriber %d did not reach subscribed=%v: %v", chatID, want, err)
+			}
+			t.Fatalf("subscriber %d did not reach subscribed=%v", chatID, want)
+		case <-tick.C:
+		}
 	}
 }
 

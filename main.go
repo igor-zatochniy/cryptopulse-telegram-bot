@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -105,23 +106,83 @@ type Job struct {
 	DoneFunc  func()
 }
 
+type clientRateLimitEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+type ClientRateLimiter struct {
+	mu          sync.Mutex
+	limit       rate.Limit
+	burst       int
+	ttl         time.Duration
+	lastCleanup time.Time
+	clients     map[string]*clientRateLimitEntry
+}
+
+func newClientRateLimiter(limit rate.Limit, burst int, ttl time.Duration) *ClientRateLimiter {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+
+	return &ClientRateLimiter{
+		limit:   limit,
+		burst:   burst,
+		ttl:     ttl,
+		clients: make(map[string]*clientRateLimitEntry),
+	}
+}
+
+func (l *ClientRateLimiter) Allow(clientKey string) bool {
+	if clientKey == "" {
+		clientKey = "unknown"
+	}
+
+	now := time.Now()
+
+	l.mu.Lock()
+	if now.Sub(l.lastCleanup) >= l.ttl {
+		for key, entry := range l.clients {
+			if now.Sub(entry.lastSeen) >= l.ttl {
+				delete(l.clients, key)
+			}
+		}
+		l.lastCleanup = now
+	}
+
+	entry, ok := l.clients[clientKey]
+	if !ok {
+		entry = &clientRateLimitEntry{
+			limiter: rate.NewLimiter(l.limit, l.burst),
+		}
+		l.clients[clientKey] = entry
+	}
+	entry.lastSeen = now
+	limiter := entry.limiter
+	l.mu.Unlock()
+
+	return limiter.Allow()
+}
+
 // --- СТРУКТУРА ЗАСТОСУНКУ (DEPENDENCY INJECTION) ---
 
 type App struct {
-	db                 *sql.DB
-	bot                *tgbotapi.BotAPI
-	priceCache         *PriceCache
-	langCache          *lru.Cache[int64, string]
-	telegramUpdateChan chan tgbotapi.Update
-	cronJobChan        chan Job
-	kyivLoc            *time.Location
-	httpClient         *http.Client
-	webhookSecret      string
-	cronSecret         string
-	isCronRunning      atomic.Bool
-	producerMu         sync.Mutex
-	producerWG         sync.WaitGroup
-	shuttingDown       bool
+	db                   *sql.DB
+	bot                  *tgbotapi.BotAPI
+	priceCache           *PriceCache
+	langCache            *lru.Cache[int64, string]
+	telegramUpdateShards []chan tgbotapi.Update
+	cronJobChan          chan Job
+	kyivLoc              *time.Location
+	httpClient           *http.Client
+	webhookSecret        string
+	cronSecret           string
+	isCronRunning        atomic.Bool
+	cronBatchWG          sync.WaitGroup
+	producerMu           sync.Mutex
+	producerWG           sync.WaitGroup
+	shuttingDown         bool
+	beforeTelegramUpdate func(context.Context, tgbotapi.Update)
 }
 
 var trackedCoins = []struct {
@@ -136,6 +197,8 @@ var trackedCoins = []struct {
 }
 
 const cronBatchLimit = 100
+const telegramShardCount = 20
+const telegramShardBuffer = 50
 
 var (
 	cronRunsTotal = promauto.NewCounterVec(
@@ -448,7 +511,7 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 			if err != nil {
 				dbOperationsTotal.WithLabelValues("price_upsert", "error").Inc()
 				slog.Error(
-					"failed to sync newly fetched price values to data nodes",
+					"failed to persist fetched price",
 					"symbol",
 					c.Symbol,
 					"error",
@@ -554,7 +617,7 @@ func (a *App) WarmupCache(ctx context.Context) {
 
 	rows, err := a.db.QueryContext(pricesCtx, "SELECT symbol, price FROM market_prices")
 	if err != nil {
-		slog.Error("warmup query engine pricing schema error", "error", err)
+		slog.Error("failed to load price cache from database", "error", err)
 		return
 	}
 	defer rows.Close()
@@ -563,14 +626,14 @@ func (a *App) WarmupCache(ctx context.Context) {
 		var s string
 		var p float64
 		if err := rows.Scan(&s, &p); err != nil {
-			slog.Error("failed to scan warmup row chunk data", "error", err)
+			slog.Error("failed to scan price cache row", "error", err)
 			continue
 		}
 		a.priceCache.Store(s, p)
 	}
 
 	if err := rows.Err(); err != nil {
-		slog.Error("warmup rows compilation iteration error", "error", err)
+		slog.Error("failed while iterating price cache rows", "error", err)
 	}
 
 	langsCtx, langsCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -578,7 +641,7 @@ func (a *App) WarmupCache(ctx context.Context) {
 
 	subRows, err := a.db.QueryContext(langsCtx, "SELECT chat_id, language_code FROM subscribers")
 	if err != nil {
-		slog.Error("failed to execute dynamic warmup subscription cache codes", "error", err)
+		slog.Error("failed to load subscriber language cache", "error", err)
 		return
 	}
 	defer subRows.Close()
@@ -593,7 +656,7 @@ func (a *App) WarmupCache(ctx context.Context) {
 		}
 	}
 	slog.Info(
-		"cache schema initialization completed successfully",
+		"cache warmup completed",
 		"prices",
 		len(trackedCoins),
 		"langs",
@@ -612,50 +675,116 @@ func (a *App) alertWorker(ctx context.Context, wg *sync.WaitGroup) {
 				return
 			}
 
-			func() {
-				defer job.DoneFunc()
-
-				msg := tgbotapi.NewMessage(job.ChatID, job.Text)
-				msg.ParseMode = "Markdown"
-				msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
-
-				if _, err := a.bot.Send(msg); err != nil {
-					errorType := "transient"
-					slog.Error(
-						"failed to send scheduled alert telegram packet",
-						"chat_id",
-						job.ChatID,
-						"error",
-						err,
-					)
-
-					if isPermanentTelegramSendError(err) {
-						errorType = "permanent"
-						a.markSubscriberUnsubscribed(job.ChatID)
-					}
-
-					telegramSendErrorsTotal.WithLabelValues(errorType).Inc()
-					cronDeliveriesTotal.WithLabelValues("failed_" + errorType).Inc()
-					return
-				}
-
-				cronDeliveriesTotal.WithLabelValues("sent").Inc()
-				job.Collector.Add(job.ChatID)
-			}()
+			a.processCronJob(job)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
-func (a *App) updateWorker(ctx context.Context, wg *sync.WaitGroup) {
+
+func (a *App) processCronJob(job Job) {
+	defer func() {
+		if job.DoneFunc != nil {
+			job.DoneFunc()
+		}
+	}()
+
+	msg := tgbotapi.NewMessage(job.ChatID, job.Text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
+
+	if _, err := a.bot.Send(msg); err != nil {
+		errorType := "transient"
+		slog.Error(
+			"failed to send scheduled alert",
+			"chat_id",
+			job.ChatID,
+			"error",
+			err,
+		)
+
+		if isPermanentTelegramSendError(err) {
+			errorType = "permanent"
+			a.markSubscriberUnsubscribed(job.ChatID)
+		}
+
+		telegramSendErrorsTotal.WithLabelValues(errorType).Inc()
+		cronDeliveriesTotal.WithLabelValues("failed_" + errorType).Inc()
+		return
+	}
+
+	cronDeliveriesTotal.WithLabelValues("sent").Inc()
+	job.Collector.Add(job.ChatID)
+}
+func newTelegramUpdateShards(count, buffer int) []chan tgbotapi.Update {
+	shards := make([]chan tgbotapi.Update, count)
+	for i := range shards {
+		shards[i] = make(chan tgbotapi.Update, buffer)
+	}
+	return shards
+}
+
+func telegramUpdateChatID(update tgbotapi.Update) (int64, bool) {
+	if update.Message != nil && update.Message.Chat != nil {
+		return update.Message.Chat.ID, true
+	}
+	if update.CallbackQuery != nil && update.CallbackQuery.Message != nil && update.CallbackQuery.Message.Chat != nil {
+		return update.CallbackQuery.Message.Chat.ID, true
+	}
+	if update.EditedMessage != nil && update.EditedMessage.Chat != nil {
+		return update.EditedMessage.Chat.ID, true
+	}
+	if update.ChannelPost != nil && update.ChannelPost.Chat != nil {
+		return update.ChannelPost.Chat.ID, true
+	}
+	if update.EditedChannelPost != nil && update.EditedChannelPost.Chat != nil {
+		return update.EditedChannelPost.Chat.ID, true
+	}
+	return 0, false
+}
+
+func telegramShardIndex(chatID int64, shardCount int) int {
+	if shardCount <= 1 {
+		return 0
+	}
+
+	idx := chatID % int64(shardCount)
+	if idx < 0 {
+		idx += int64(shardCount)
+	}
+	return int(idx)
+}
+
+func (a *App) enqueueTelegramUpdate(ctx context.Context, update tgbotapi.Update) bool {
+	if len(a.telegramUpdateShards) == 0 {
+		return false
+	}
+
+	chatID, ok := telegramUpdateChatID(update)
+	if !ok {
+		chatID = 0
+	}
+	shard := a.telegramUpdateShards[telegramShardIndex(chatID, len(a.telegramUpdateShards))]
+
+	select {
+	case shard <- update:
+		return true
+	case <-time.After(1 * time.Second):
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (a *App) updateWorker(ctx context.Context, wg *sync.WaitGroup, updates <-chan tgbotapi.Update) {
 	defer wg.Done()
 	for {
 		select {
-		case update, ok := <-a.telegramUpdateChan:
+		case update, ok := <-updates:
 			if !ok {
 				return
 			}
-			a.processTelegramUpdate(update)
+			a.processTelegramUpdate(ctx, update)
 		case <-ctx.Done():
 			return
 		}
@@ -679,11 +808,41 @@ func (a *App) rateLimitMiddleware(limiter *rate.Limiter, next http.HandlerFunc) 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !limiter.Allow() {
 			slog.Warn(
-				"rate limit exceeded, dropping request",
+				"global rate limit exceeded, dropping request",
 				"endpoint",
 				r.URL.Path,
 				"remote_ip",
 				r.RemoteAddr,
+			)
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("Too Many Requests"))
+			return
+		}
+		next(w, r)
+	}
+}
+
+func requestClientKey(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	if r.RemoteAddr != "" {
+		return r.RemoteAddr
+	}
+	return "unknown"
+}
+
+func (a *App) clientRateLimitMiddleware(limiter *ClientRateLimiter, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		clientKey := requestClientKey(r)
+		if !limiter.Allow(clientKey) {
+			slog.Warn(
+				"client rate limit exceeded, dropping request",
+				"endpoint",
+				r.URL.Path,
+				"remote_ip",
+				clientKey,
 			)
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte("Too Many Requests"))
@@ -904,6 +1063,34 @@ func (a *App) releaseCronClaims(ids []int64) error {
 	dbOperationsTotal.WithLabelValues("release_cron_claims", "success").Inc()
 	return err
 }
+
+func (a *App) finishCronBatch(collector *SafeIDCollector, allIDs []int64, sentAt time.Time, partial bool, dispatchWG *sync.WaitGroup) {
+	defer a.cronBatchWG.Done()
+	defer a.isCronRunning.Store(false)
+
+	dispatchWG.Wait()
+	slog.Info("cron batch delivery completed", "subscribers", len(allIDs))
+
+	successIDs := collector.FlushIDs()
+	if err := a.markCronDeliveriesSent(successIDs, sentAt); err != nil {
+		cronRunsTotal.WithLabelValues("mark_sent_error").Inc()
+		slog.Error("failed to update timestamps for successful cron deliveries", "error", err)
+		return
+	}
+
+	if err := a.releaseCronClaims(allIDs); err != nil {
+		cronRunsTotal.WithLabelValues("release_claims_error").Inc()
+		slog.Error("failed to release cron claims after dispatch completion", "error", err)
+		return
+	}
+
+	status := "success"
+	if partial {
+		status = "partial_success"
+	}
+	cronRunsTotal.WithLabelValues(status).Inc()
+}
+
 func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	var providedToken string
@@ -933,7 +1120,12 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("Cron execution already in progress"))
 		return
 	}
-	defer a.isCronRunning.Store(false)
+	releaseCronLock := true
+	defer func() {
+		if releaseCronLock {
+			a.isCronRunning.Store(false)
+		}
+	}()
 
 	slog.Info("valid cron trigger received, claiming due subscriber batch")
 	ctx := r.Context()
@@ -958,8 +1150,10 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	allIDs := subscriberIDs(subs)
 	collector := &SafeIDCollector{ids: make([]int64, 0, len(subs))}
 	var dispatchWG sync.WaitGroup
+	enqueuedJobs := 0
+	enqueueFailed := false
 
-	// Handler чекає завершення вже поставлених jobs, щоб не відповісти cron-у до фіксації результатів у БД.
+enqueueLoop:
 	for _, s := range subs {
 		pricesTextLocal := a.getFormattedPricesFromCache(s.Lang)
 		header := fmt.Sprintf(getMsgText(s.Lang, "alert_hdr"), currentTime)
@@ -981,40 +1175,47 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 
 		select {
 		case a.cronJobChan <- job:
+			enqueuedJobs++
 		case <-ctx.Done():
 			cronRunsTotal.WithLabelValues("enqueue_canceled").Inc()
 			cronDeliveriesTotal.WithLabelValues("enqueue_canceled").Inc()
 			dispatchWG.Done()
-			slog.Warn(
-				"cron worker channel submission canceled due to context expiration/shutdown",
-				"chat_id",
-				s.ID,
-			)
-			return
+			slog.Warn("cron enqueue canceled", "chat_id", s.ID)
+			enqueueFailed = true
+			break enqueueLoop
+		case <-time.After(1 * time.Second):
+			cronRunsTotal.WithLabelValues("enqueue_timeout").Inc()
+			cronDeliveriesTotal.WithLabelValues("enqueue_timeout").Inc()
+			dispatchWG.Done()
+			slog.Warn("cron enqueue timed out", "chat_id", s.ID)
+			enqueueFailed = true
+			break enqueueLoop
 		}
 	}
 
-	dispatchWG.Wait()
-	slog.Info("all cron dispatch batch routines reported completion tasks successfully")
-
-	successIDs := collector.FlushIDs()
-	if err := a.markCronDeliveriesSent(successIDs, subs[0].ClaimedAt); err != nil {
-		cronRunsTotal.WithLabelValues("mark_sent_error").Inc()
-		slog.Error("failed to update timestamps for successful cron deliveries", "error", err)
-		w.WriteHeader(http.StatusInternalServerError)
+	if enqueuedJobs == 0 {
+		if err := a.releaseCronClaims(allIDs); err != nil {
+			cronRunsTotal.WithLabelValues("release_claims_error").Inc()
+			slog.Error("failed to release cron claims after enqueue failure", "error", err)
+		}
+		cronRunsTotal.WithLabelValues("enqueue_unavailable").Inc()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("Cron queue is unavailable"))
 		return
 	}
 
-	if err := a.releaseCronClaims(allIDs); err != nil {
-		cronRunsTotal.WithLabelValues("release_claims_error").Inc()
-		slog.Error("failed to release cron claims after dispatch completion", "error", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+	a.cronBatchWG.Add(1)
+	go a.finishCronBatch(collector, allIDs, subs[0].ClaimedAt, enqueueFailed, &dispatchWG)
+	releaseCronLock = false
+
+	if enqueueFailed {
+		slog.Warn("cron batch accepted with partial enqueue", "claimed", len(subs), "enqueued", enqueuedJobs)
+	} else {
+		slog.Info("cron batch accepted", "claimed", len(subs), "enqueued", enqueuedJobs)
 	}
 
-	cronRunsTotal.WithLabelValues("success").Inc()
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Cron processing completed"))
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("Cron batch accepted"))
 }
 
 func (a *App) metricsAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -1053,28 +1254,32 @@ func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ВИПРАВЛЕННЯ: Додано 1-секундний м'який таймаут очікування буфера.
-	// Якщо канал зайнятий на частки секунди, бот не поверне помилку 503 одразу, а дочекається вільного воркера.
-	select {
-	case a.telegramUpdateChan <- update:
+	// Даємо буферу короткий шанс звільнитися, щоб не рвати запит через короткий пік навантаження.
+	// Якщо воркер ось-ось звільниться, бот поверне OK без зайвої помилки 503.
+	if a.enqueueTelegramUpdate(r.Context(), update) {
 		webhookUpdatesTotal.WithLabelValues("accepted").Inc()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
-	case <-time.After(1 * time.Second):
-		webhookUpdatesTotal.WithLabelValues("dropped_queue_full").Inc()
-		slog.Warn(
-			"telegram incoming update channel queue full, dropping packet and backpressuring",
-			"update_id",
-			update.UpdateID,
-		)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("503 Service Unavailable: Internal buffer saturated"))
+		return
 	}
+
+	webhookUpdatesTotal.WithLabelValues("dropped_queue_full").Inc()
+	slog.Warn(
+		"telegram update queue is full, dropping update",
+		"update_id",
+		update.UpdateID,
+	)
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte("503 Service Unavailable: Internal buffer saturated"))
 }
 
-func (a *App) processTelegramUpdate(update tgbotapi.Update) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+
+	if a.beforeTelegramUpdate != nil {
+		a.beforeTelegramUpdate(ctx, update)
+	}
 
 	if update.CallbackQuery != nil {
 		if update.CallbackQuery.Message == nil {
@@ -1095,7 +1300,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
 
 			if !allowedLanguages[newLang] {
 				slog.Error(
-					"security execution block triggered: invalid language query string",
+					"invalid language selection",
 					"chat_id",
 					chatID,
 					"payload",
@@ -1110,7 +1315,7 @@ func (a *App) processTelegramUpdate(update tgbotapi.Update) {
                      ON CONFLICT (chat_id) DO UPDATE SET language_code = EXCLUDED.language_code`, chatID, newLang); err != nil {
 				dbOperationsTotal.WithLabelValues("set_language", "error").Inc()
 				slog.Error(
-					"failed to save language settings for user node",
+					"failed to save language settings",
 					"chat_id",
 					chatID,
 					"error",
@@ -1380,43 +1585,45 @@ func main() {
 		os.Exit(1)
 	}
 
-	telegramUpdateChanInstance := make(chan tgbotapi.Update, 1000)
+	telegramUpdateShards := newTelegramUpdateShards(telegramShardCount, telegramShardBuffer)
 	cronJobChanInstance := make(chan Job, 5000)
 
 	app := &App{
-		db:                 rawDB,
-		bot:                tgBot,
-		priceCache:         &PriceCache{store: make(map[string]PriceEntry)},
-		langCache:          lruCacheInstance,
-		telegramUpdateChan: telegramUpdateChanInstance,
-		cronJobChan:        cronJobChanInstance,
-		kyivLoc:            kyivLocation,
-		httpClient:         customHTTPClient,
-		webhookSecret:      webhookSecretToken,
-		cronSecret:         cronSecretToken,
+		db:                   rawDB,
+		bot:                  tgBot,
+		priceCache:           &PriceCache{store: make(map[string]PriceEntry)},
+		langCache:            lruCacheInstance,
+		telegramUpdateShards: telegramUpdateShards,
+		cronJobChan:          cronJobChanInstance,
+		kyivLoc:              kyivLocation,
+		httpClient:           customHTTPClient,
+		webhookSecret:        webhookSecretToken,
+		cronSecret:           cronSecretToken,
 	}
 
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	workerCtx, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
 
 	app.WarmupCache(runCtx)
 
 	go app.startPriceTicker(runCtx)
 
 	var telegramWG sync.WaitGroup
-	for i := 1; i <= 20; i++ {
+	for _, updates := range app.telegramUpdateShards {
 		telegramWG.Add(1)
-		go app.updateWorker(runCtx, &telegramWG)
+		go app.updateWorker(workerCtx, &telegramWG, updates)
 	}
 
 	var cronWG sync.WaitGroup
 	for i := 1; i <= 5; i++ {
 		cronWG.Add(1)
-		go app.alertWorker(runCtx, &cronWG)
+		go app.alertWorker(workerCtx, &cronWG)
 	}
 
 	cronLimiter := rate.NewLimiter(rate.Every(30*time.Second), 5)
-	webhookLimiter := rate.NewLimiter(rate.Limit(50), 100)
+	webhookLimiter := newClientRateLimiter(rate.Limit(50), 100, 10*time.Minute)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/live", methodMiddleware(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
@@ -1441,7 +1648,7 @@ func main() {
 	}))
 	mux.HandleFunc("/metrics", methodMiddleware(http.MethodGet, app.metricsAuthMiddleware(promhttp.Handler().ServeHTTP)))
 	mux.HandleFunc("/cron", methodMiddleware(http.MethodPost, app.producerMiddleware(app.rateLimitMiddleware(cronLimiter, app.handleCron))))
-	mux.HandleFunc("/webhook", methodMiddleware(http.MethodPost, app.producerMiddleware(app.rateLimitMiddleware(webhookLimiter, app.handleWebhook))))
+	mux.HandleFunc("/webhook", methodMiddleware(http.MethodPost, app.producerMiddleware(app.clientRateLimitMiddleware(webhookLimiter, app.handleWebhook))))
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -1490,14 +1697,22 @@ func main() {
 	producerCancel()
 
 	if producersDrained {
-		close(app.telegramUpdateChan)
+		for _, updates := range app.telegramUpdateShards {
+			close(updates)
+		}
 		close(app.cronJobChan)
 	} else {
 		slog.Warn("skipping channel close because HTTP producers are still active")
+		stopWorkers()
 	}
 
 	telegramWG.Wait()
 	cronWG.Wait()
+	if producersDrained {
+		app.cronBatchWG.Wait()
+	} else {
+		slog.Warn("skipping cron batch wait because HTTP producers are still active")
+	}
 	slog.Info("background worker pools stopped")
 
 	rawDB.Close()

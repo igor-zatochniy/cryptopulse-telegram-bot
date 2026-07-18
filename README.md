@@ -240,6 +240,7 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 - Cron і metrics endpoints потребують Bearer authentication.
 - Тіло webhook request має обмеження за розміром.
 - HTTP methods явно перевіряються.
+- Cron має глобальний rate limit, а webhook обмежується окремо для кожного remote client.
 - PostgreSQL не має бути відкритим у public internet. У production обмежуйте `5432/tcp` trusted egress IPs, private networking або VPN.
 - Docker runtime не запускається від root.
 
@@ -248,8 +249,9 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 - Вибір cron subscribers використовує короткі database claims із `FOR UPDATE SKIP LOCKED`.
 - Telegram sends виконуються поза database transactions.
 - Успішні sends оновлюють `last_sent`; невдалі sends не оновлюють.
-- Worker pools зупиняються через context cancellation і channel draining.
 - HTTP producers відстежуються через `WaitGroup` під час shutdown.
+- Після зупинки producers worker pools дочитують закриті канали, щоб не губити вже прийняті Telegram updates і cron jobs.
+- Context cancellation використовується як forced fallback, якщо producers не вдалося зупинити вчасно.
 
 ## Ключові Інженерні Рішення
 
