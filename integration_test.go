@@ -218,7 +218,6 @@ func newIntegrationApp(t *testing.T, db *sql.DB, bot *tgbotapi.BotAPI) *App {
 		priceCache:           &PriceCache{store: make(map[string]PriceEntry)},
 		langCache:            cache,
 		telegramUpdateShards: newTelegramUpdateShards(telegramShardCount, telegramShardBuffer),
-		cronJobChan:          make(chan Job, 100),
 		kyivLoc:              time.UTC,
 		httpClient:           http.DefaultClient,
 		webhookSecret:        "webhook-secret",
@@ -400,11 +399,7 @@ func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
 	var workerWG sync.WaitGroup
 	workerWG.Add(1)
 	go app.alertWorker(runCtx, &workerWG)
-	t.Cleanup(func() {
-		cancel()
-		close(app.cronJobChan)
-		workerWG.Wait()
-	})
+	t.Cleanup(workerWG.Wait)
 
 	req := httptest.NewRequest(http.MethodPost, "/cron", nil)
 	req.Header.Set("Authorization", "Bearer cron-secret")
@@ -415,14 +410,32 @@ func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("cron status = %d, body = %q", rec.Code, rec.Body.String())
 	}
-	app.cronBatchWG.Wait()
+	received301 := waitForNotificationJobStatus(t, db, 301, "sent")
+	pending302 := waitForNotificationJobStatus(t, db, 302, "pending")
+	failed303 := waitForNotificationJobStatus(t, db, 303, "failed")
+
+	if received301.Attempts != 1 {
+		t.Fatalf("job 301 attempts = %d, want 1", received301.Attempts)
+	}
+	if pending302.Attempts != 1 {
+		t.Fatalf("job 302 attempts = %d, want 1", pending302.Attempts)
+	}
+	if failed303.Attempts != 1 {
+		t.Fatalf("job 303 attempts = %d, want 1", failed303.Attempts)
+	}
+	if !pending302.LastError.Valid || !strings.Contains(pending302.LastError.String, "retry later") {
+		t.Fatalf("job 302 last_error = %+v, want transient retry message", pending302.LastError)
+	}
+	if !failed303.LastError.Valid || !strings.Contains(failed303.LastError.String, "blocked") {
+		t.Fatalf("job 303 last_error = %+v, want permanent block message", failed303.LastError)
+	}
 
 	assertLastSentAdvanced(t, db, 301, oldLastSent)
 	assertClaimCleared(t, db, 301)
 	assertSubscribed(t, db, 301, true)
 
 	assertLastSentUnchanged(t, db, 302, oldLastSent)
-	assertClaimCleared(t, db, 302)
+	assertClaimActive(t, db, 302)
 	assertSubscribed(t, db, 302, true)
 
 	assertLastSentUnchanged(t, db, 303, oldLastSent)
@@ -450,14 +463,11 @@ func TestIntegrationCronReturnsBeforeTelegramDeliveryCompletes(t *testing.T) {
 	insertSubscriber(t, db, chatID, true, 1, "ua", oldLastSent)
 
 	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var workerWG sync.WaitGroup
 	workerWG.Add(1)
 	go app.alertWorker(runCtx, &workerWG)
-	t.Cleanup(func() {
-		cancel()
-		close(app.cronJobChan)
-		workerWG.Wait()
-	})
+	t.Cleanup(workerWG.Wait)
 
 	req := httptest.NewRequest(http.MethodPost, "/cron", nil)
 	req.Header.Set("Authorization", "Bearer cron-secret")
@@ -484,8 +494,13 @@ func TestIntegrationCronReturnsBeforeTelegramDeliveryCompletes(t *testing.T) {
 		t.Fatal("telegram delivery did not start")
 	}
 
+	stateDuringSend := waitForNotificationJobStatus(t, db, chatID, "sending")
+	if stateDuringSend.Attempts != 1 {
+		t.Fatalf("job attempts while sending = %d, want 1", stateDuringSend.Attempts)
+	}
+
 	close(releaseSend)
-	app.cronBatchWG.Wait()
+	waitForNotificationJobStatus(t, db, chatID, "sent")
 	assertLastSentAdvanced(t, db, chatID, oldLastSent)
 }
 
@@ -498,30 +513,73 @@ func TestIntegrationCronRecordsClaimMinuteAsLastSent(t *testing.T) {
 	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
 	insertSubscriber(t, db, chatID, true, 1, "ua", oldLastSent)
 
-	subs, err := app.claimDueSubscribers(context.Background())
-	if err != nil {
-		t.Fatalf("claim due subscribers: %v", err)
-	}
-	if len(subs) != 1 {
-		t.Fatalf("claimed subscribers = %d, want 1", len(subs))
-	}
-	if subs[0].ID != chatID {
-		t.Fatalf("claimed chat id = %d, want %d", subs[0].ID, chatID)
-	}
-	if subs[0].ClaimedAt.IsZero() {
-		t.Fatal("claimed_at is zero")
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var workerWG sync.WaitGroup
+	workerWG.Add(1)
+	go app.alertWorker(runCtx, &workerWG)
+	t.Cleanup(workerWG.Wait)
+
+	req := httptest.NewRequest(http.MethodPost, "/cron", nil)
+	req.Header.Set("Authorization", "Bearer cron-secret")
+	rec := httptest.NewRecorder()
+	app.handleCron(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("cron status = %d, body = %q", rec.Code, rec.Body.String())
 	}
 
-	if err := app.markCronDeliveriesSent([]int64{chatID}, subs[0].ClaimedAt); err != nil {
-		t.Fatalf("mark cron delivery sent: %v", err)
-	}
-
+	job := waitForNotificationJobStatus(t, db, chatID, "sent")
 	lastSent := selectLastSent(t, db, chatID)
-	expectedLastSent := subs[0].ClaimedAt.Truncate(time.Minute)
+	expectedLastSent := job.ScheduledAt.Truncate(time.Minute)
 	if lastSent.Sub(expectedLastSent).Abs() > time.Second {
 		t.Fatalf("last_sent = %s, want close to claimed minute %s", lastSent, expectedLastSent)
 	}
 	assertClaimCleared(t, db, chatID)
+}
+
+func TestIntegrationCronUsesPostgresAdvisoryLock(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 307
+	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
+	insertSubscriber(t, db, chatID, true, 1, "ua", oldLastSent)
+
+	lockConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open advisory lock connection: %v", err)
+	}
+	t.Cleanup(func() {
+		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer unlockCancel()
+		_, _ = lockConn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock($1)`, cronAdvisoryLockKey)
+		_ = lockConn.Close()
+	})
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer lockCancel()
+	var acquired bool
+	if err := lockConn.QueryRowContext(lockCtx, `SELECT pg_try_advisory_lock($1)`, cronAdvisoryLockKey).Scan(&acquired); err != nil {
+		t.Fatalf("acquire advisory lock: %v", err)
+	}
+	if !acquired {
+		t.Fatal("failed to acquire advisory lock in test setup")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/cron", nil)
+	req.Header.Set("Authorization", "Bearer cron-secret")
+	rec := httptest.NewRecorder()
+
+	app.handleCron(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("cron status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	assertNoNotificationJobs(t, db, chatID)
+	assertLastSentUnchanged(t, db, chatID, oldLastSent)
 }
 
 func insertSubscriber(t *testing.T, db *sql.DB, chatID int64, subscribed bool, interval int, lang string, lastSent time.Time) {
@@ -644,6 +702,18 @@ func assertClaimCleared(t *testing.T, db *sql.DB, chatID int64) {
 	}
 }
 
+func assertClaimActive(t *testing.T, db *sql.DB, chatID int64) {
+	t.Helper()
+
+	var isNull bool
+	if err := db.QueryRow("SELECT cron_claimed_until IS NULL FROM subscribers WHERE chat_id = $1", chatID).Scan(&isNull); err != nil {
+		t.Fatalf("select cron claim %d: %v", chatID, err)
+	}
+	if isNull {
+		t.Fatalf("subscriber %d cron_claimed_until is NULL, want active claim", chatID)
+	}
+}
+
 func assertLastSentAdvanced(t *testing.T, db *sql.DB, chatID int64, oldLastSent time.Time) {
 	t.Helper()
 
@@ -670,6 +740,77 @@ func selectLastSent(t *testing.T, db *sql.DB, chatID int64) time.Time {
 		t.Fatalf("select last_sent %d: %v", chatID, err)
 	}
 	return lastSent
+}
+
+type notificationJobState struct {
+	Status        string
+	Attempts      int
+	ScheduledAt   time.Time
+	NextAttemptAt time.Time
+	ClaimedUntil  sql.NullTime
+	SentAt        sql.NullTime
+	FailedAt      sql.NullTime
+	LastError     sql.NullString
+}
+
+func waitForNotificationJobStatus(t *testing.T, db *sql.DB, chatID int64, wantStatus string) notificationJobState {
+	t.Helper()
+
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		job, err := selectNotificationJobState(t, db, chatID)
+		if err == nil && job.Status == wantStatus {
+			return job
+		}
+
+		select {
+		case <-deadline:
+			if err != nil {
+				t.Fatalf("notification job %d did not reach status %q: %v", chatID, wantStatus, err)
+			}
+			t.Fatalf("notification job %d did not reach status %q, last status = %q", chatID, wantStatus, job.Status)
+		case <-tick.C:
+		}
+	}
+}
+
+func selectNotificationJobState(t *testing.T, db *sql.DB, chatID int64) (notificationJobState, error) {
+	t.Helper()
+
+	var job notificationJobState
+	err := db.QueryRow(
+		`SELECT status, attempts, scheduled_at, next_attempt_at, claimed_until, sent_at, failed_at, last_error
+		 FROM notification_jobs
+		 WHERE chat_id = $1
+		 ORDER BY id DESC
+		 LIMIT 1`,
+		chatID,
+	).Scan(
+		&job.Status,
+		&job.Attempts,
+		&job.ScheduledAt,
+		&job.NextAttemptAt,
+		&job.ClaimedUntil,
+		&job.SentAt,
+		&job.FailedAt,
+		&job.LastError,
+	)
+	return job, err
+}
+
+func assertNoNotificationJobs(t *testing.T, db *sql.DB, chatID int64) {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM notification_jobs WHERE chat_id = $1", chatID).Scan(&count); err != nil {
+		t.Fatalf("count notification jobs %d: %v", chatID, err)
+	}
+	if count != 0 {
+		t.Fatalf("notification jobs for chat %d = %d, want 0", chatID, count)
+	}
 }
 
 func TestIntegrationPermanentTelegramErrorClassifier(t *testing.T) {

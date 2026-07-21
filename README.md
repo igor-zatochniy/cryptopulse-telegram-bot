@@ -229,7 +229,7 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 
 - `/live` залишається lightweight для liveness checks.
 - `/ready` повертає помилку, якщо PostgreSQL недоступний.
-- `/cron` відхиляє unauthorized calls і overlapping runs.
+- `/cron` відхиляє unauthorized calls і overlapping runs через PostgreSQL advisory lock.
 - Permanent Telegram delivery errors відписують недоступних користувачів.
 - Transient Telegram errors не оновлюють `last_sent`, щоб дозволити наступну спробу.
 
@@ -247,10 +247,11 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 ## Нотатки З Надійності
 
 - Вибір cron subscribers використовує короткі database claims із `FOR UPDATE SKIP LOCKED`.
+- Cron jobs створюються як durable rows у PostgreSQL outbox.
 - Telegram sends виконуються поза database transactions.
 - Успішні sends оновлюють `last_sent`; невдалі sends не оновлюють.
 - HTTP producers відстежуються через `WaitGroup` під час shutdown.
-- Після зупинки producers worker pools дочитують закриті канали, щоб не губити вже прийняті Telegram updates і cron jobs.
+- Після зупинки producers worker pools дочитують закриті канали, щоб не губити вже прийняті Telegram updates; cron jobs залишаються durable в PostgreSQL outbox.
 - Context cancellation використовується як forced fallback, якщо producers не вдалося зупинити вчасно.
 
 ## Ключові Інженерні Рішення

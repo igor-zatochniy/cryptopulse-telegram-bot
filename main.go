@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	_ "time/tzdata"
@@ -75,35 +74,13 @@ func (c *PriceCache) Store(symbol string, newPrice float64) {
 	}
 }
 
-type SafeIDCollector struct {
-	mu  sync.Mutex
-	ids []int64
-}
-
-func (c *SafeIDCollector) Add(id int64) {
-	c.mu.Lock()
-	c.ids = append(c.ids, id)
-	c.mu.Unlock()
-}
-
-func (c *SafeIDCollector) FlushIDs() []int64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.ids) == 0 {
-		return nil
-	}
-	result := make([]int64, len(c.ids))
-	copy(result, c.ids)
-	c.ids = nil
-	return result
-}
-
-type Job struct {
-	ChatID    int64
-	Lang      string
-	Text      string
-	Collector *SafeIDCollector
-	DoneFunc  func()
+type NotificationJob struct {
+	ID          int64
+	ChatID      int64
+	Lang        string
+	Text        string
+	ScheduledAt time.Time
+	Attempts    int
 }
 
 type clientRateLimitEntry struct {
@@ -172,13 +149,10 @@ type App struct {
 	priceCache           *PriceCache
 	langCache            *lru.Cache[int64, string]
 	telegramUpdateShards []chan tgbotapi.Update
-	cronJobChan          chan Job
 	kyivLoc              *time.Location
 	httpClient           *http.Client
 	webhookSecret        string
 	cronSecret           string
-	isCronRunning        atomic.Bool
-	cronBatchWG          sync.WaitGroup
 	producerMu           sync.Mutex
 	producerWG           sync.WaitGroup
 	shuttingDown         bool
@@ -199,6 +173,12 @@ var trackedCoins = []struct {
 const cronBatchLimit = 100
 const telegramShardCount = 20
 const telegramShardBuffer = 50
+
+// Один job може жити довше одного Telegram send, але lease має перекривати
+// весь batch із запасом, щоб другий worker не підхопив той самий рядок зарано.
+const notificationJobClaimWindow = 15 * time.Minute
+const notificationJobMaxAttempts = 3
+const cronAdvisoryLockKey int64 = 0x63726f6e6c6f636b
 
 var (
 	cronRunsTotal = promauto.NewCounterVec(
@@ -668,44 +648,256 @@ func (a *App) WarmupCache(ctx context.Context) {
 
 func (a *App) alertWorker(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
+
+	pollTicker := time.NewTicker(250 * time.Millisecond)
+	defer pollTicker.Stop()
+
 	for {
-		select {
-		case job, ok := <-a.cronJobChan:
-			if !ok {
+		job, err := a.claimPendingNotificationJob(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
 				return
 			}
 
-			a.processCronJob(job)
+			slog.Error("failed to claim pending notification job", "error", err)
+			select {
+			case <-pollTicker.C:
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		if job != nil {
+			a.processNotificationJob(*job)
+			continue
+		}
+
+		select {
+		case <-pollTicker.C:
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (a *App) processCronJob(job Job) {
+func postgresIntervalString(d time.Duration) string {
+	if d <= 0 {
+		return "0 seconds"
+	}
+	return fmt.Sprintf("%d seconds", int(d.Seconds()))
+}
+
+func truncateErrorText(text string, limit int) string {
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit]
+}
+
+func retryDelayForAttempt(attempts int) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	delay := time.Duration(attempts) * time.Minute
+	if delay > 10*time.Minute {
+		delay = 10 * time.Minute
+	}
+	return delay
+}
+
+func (a *App) createCronNotificationJobs(ctx context.Context) (int, error) {
+	dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer dbCancel()
+
+	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("create_notification_jobs", "error").Inc()
+		return 0, err
+	}
 	defer func() {
-		if job.DoneFunc != nil {
-			job.DoneFunc()
-		}
+		_ = tx.Rollback()
 	}()
 
+	rows, err := tx.QueryContext(dbCtx, `WITH claim_clock AS (
+		SELECT NOW() AS claimed_at
+	), due AS (
+		SELECT s.chat_id,
+		       COALESCE(s.language_code, 'ua') AS language_code,
+		       claim_clock.claimed_at
+		FROM subscribers AS s
+		CROSS JOIN claim_clock
+		WHERE s.is_subscribed = TRUE
+		AND date_trunc('minute', COALESCE(s.last_sent, TIMESTAMPTZ 'epoch')) <= date_trunc('minute', claim_clock.claimed_at) - (COALESCE(s.interval_minutes, 60) * INTERVAL '1 minute')
+		AND (s.cron_claimed_until IS NULL OR s.cron_claimed_until < claim_clock.claimed_at)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM notification_jobs AS nj
+			WHERE nj.chat_id = s.chat_id
+			AND nj.status IN ('pending', 'sending')
+		)
+		ORDER BY s.last_sent ASC NULLS FIRST
+		LIMIT $1
+		FOR UPDATE OF s SKIP LOCKED
+	), claimed AS (
+		UPDATE subscribers AS s
+		SET cron_claimed_until = due.claimed_at + INTERVAL '15 minute'
+		FROM due
+		WHERE s.chat_id = due.chat_id
+		RETURNING s.chat_id, due.language_code, due.claimed_at
+	)
+	SELECT chat_id, language_code, claimed_at FROM claimed`, cronBatchLimit)
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("create_notification_jobs", "error").Inc()
+		return 0, err
+	}
+	defer rows.Close()
+
+	type rowData struct {
+		chatID int64
+		lang   string
+		at     time.Time
+	}
+
+	var dueRows []rowData
+	for rows.Next() {
+		var r rowData
+		if err := rows.Scan(&r.chatID, &r.lang, &r.at); err != nil {
+			dbOperationsTotal.WithLabelValues("create_notification_jobs", "error").Inc()
+			return 0, err
+		}
+		dueRows = append(dueRows, r)
+	}
+	if err := rows.Err(); err != nil {
+		dbOperationsTotal.WithLabelValues("create_notification_jobs", "error").Inc()
+		return 0, err
+	}
+
+	for _, due := range dueRows {
+		pricesTextLocal := a.getFormattedPricesFromCache(due.lang)
+		header := fmt.Sprintf(getMsgText(due.lang, "alert_hdr"), due.at.Format("15:04"))
+		text := fmt.Sprintf(
+			"%s\n\n%s\n\n_%s_",
+			header,
+			pricesTextLocal,
+			getMsgText(due.lang, "dynamics"),
+		)
+
+		if _, err := tx.ExecContext(
+			dbCtx,
+			`INSERT INTO notification_jobs (
+				chat_id,
+				language_code,
+				message_text,
+				scheduled_at,
+				status,
+				next_attempt_at
+			) VALUES ($1, $2, $3, $4, 'pending', $4)`,
+			due.chatID,
+			due.lang,
+			text,
+			due.at,
+		); err != nil {
+			dbOperationsTotal.WithLabelValues("create_notification_jobs", "error").Inc()
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		dbOperationsTotal.WithLabelValues("create_notification_jobs", "error").Inc()
+		return 0, err
+	}
+
+	dbOperationsTotal.WithLabelValues("create_notification_jobs", "success").Inc()
+	return len(dueRows), nil
+}
+
+func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob, error) {
+	dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer dbCancel()
+
+	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+		return nil, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var job NotificationJob
+	err = tx.QueryRowContext(dbCtx, `WITH next_job AS (
+		SELECT nj.id
+		FROM notification_jobs AS nj
+		WHERE nj.status IN ('pending', 'sending')
+		AND nj.next_attempt_at <= NOW()
+		AND (
+			nj.status = 'pending'
+			OR nj.claimed_until IS NULL
+			OR nj.claimed_until < NOW()
+		)
+		ORDER BY nj.scheduled_at ASC, nj.id ASC
+		LIMIT 1
+		FOR UPDATE OF nj SKIP LOCKED
+	), claimed AS (
+		UPDATE notification_jobs AS nj
+		SET status = 'sending',
+		    attempts = nj.attempts + 1,
+		    claimed_until = NOW() + $1::interval,
+		    updated_at = NOW()
+		FROM next_job
+		WHERE nj.id = next_job.id
+		RETURNING nj.id, nj.chat_id, nj.language_code, nj.message_text, nj.scheduled_at, nj.attempts
+	)
+	SELECT id, chat_id, language_code, message_text, scheduled_at, attempts FROM claimed`, postgresIntervalString(notificationJobClaimWindow)).Scan(
+		&job.ID,
+		&job.ChatID,
+		&job.Lang,
+		&job.Text,
+		&job.ScheduledAt,
+		&job.Attempts,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		dbOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+		return nil, err
+	}
+
+	dbOperationsTotal.WithLabelValues("claim_notification_job", "success").Inc()
+	return &job, nil
+}
+
+func (a *App) processNotificationJob(job NotificationJob) {
 	msg := tgbotapi.NewMessage(job.ChatID, job.Text)
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = getRefreshKeyboard(job.Lang)
 
 	if _, err := a.bot.Send(msg); err != nil {
 		errorType := "transient"
-		slog.Error(
-			"failed to send scheduled alert",
-			"chat_id",
-			job.ChatID,
-			"error",
-			err,
-		)
+		slog.Error("failed to send scheduled alert", "chat_id", job.ChatID, "error", err)
 
 		if isPermanentTelegramSendError(err) {
 			errorType = "permanent"
-			a.markSubscriberUnsubscribed(job.ChatID)
+			if markErr := a.markNotificationJobFailed(job, err, true); markErr != nil {
+				slog.Error("failed to persist permanent notification failure", "chat_id", job.ChatID, "error", markErr)
+			}
+		} else if job.Attempts >= notificationJobMaxAttempts {
+			errorType = "exhausted"
+			if markErr := a.markNotificationJobFailed(job, err, false); markErr != nil {
+				slog.Error("failed to persist exhausted notification failure", "chat_id", job.ChatID, "error", markErr)
+			}
+		} else {
+			if markErr := a.markNotificationJobRetry(job, err); markErr != nil {
+				slog.Error("failed to persist notification retry", "chat_id", job.ChatID, "error", markErr)
+			}
 		}
 
 		telegramSendErrorsTotal.WithLabelValues(errorType).Inc()
@@ -713,9 +905,179 @@ func (a *App) processCronJob(job Job) {
 		return
 	}
 
+	if err := a.markNotificationJobSent(job); err != nil {
+		slog.Error("failed to persist successful notification delivery", "chat_id", job.ChatID, "error", err)
+		cronDeliveriesTotal.WithLabelValues("sent_persist_error").Inc()
+		return
+	}
+
 	cronDeliveriesTotal.WithLabelValues("sent").Inc()
-	job.Collector.Add(job.ChatID)
 }
+
+func (a *App) markNotificationJobSent(job NotificationJob) error {
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dbCancel()
+
+	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_sent", "error").Inc()
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if _, err := tx.ExecContext(
+		dbCtx,
+		`UPDATE notification_jobs
+		 SET status = 'sent',
+		     sent_at = NOW(),
+		     claimed_until = NULL,
+		     last_error = NULL,
+		     updated_at = NOW()
+		 WHERE id = $1`,
+		job.ID,
+	); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_sent", "error").Inc()
+		return err
+	}
+
+	if _, err := tx.ExecContext(
+		dbCtx,
+		`UPDATE subscribers
+		 SET last_sent = date_trunc('minute', $2::timestamptz),
+		     cron_claimed_until = NULL
+		 WHERE chat_id = $1`,
+		job.ChatID,
+		job.ScheduledAt,
+	); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_sent", "error").Inc()
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_sent", "error").Inc()
+		return err
+	}
+
+	dbOperationsTotal.WithLabelValues("mark_notification_sent", "success").Inc()
+	return nil
+}
+
+func (a *App) markNotificationJobRetry(job NotificationJob, sendErr error) error {
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dbCancel()
+
+	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_retry", "error").Inc()
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	delay := retryDelayForAttempt(job.Attempts)
+	if _, err := tx.ExecContext(
+		dbCtx,
+		`UPDATE notification_jobs
+		 SET status = 'pending',
+		     claimed_until = NULL,
+		     next_attempt_at = NOW() + $2::interval,
+		     last_error = $3,
+		     updated_at = NOW()
+		 WHERE id = $1`,
+		job.ID,
+		postgresIntervalString(delay),
+		truncateErrorText(sendErr.Error(), 500),
+	); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_retry", "error").Inc()
+		return err
+	}
+
+	if _, err := tx.ExecContext(
+		dbCtx,
+		`UPDATE subscribers
+		 SET cron_claimed_until = NULL
+		 WHERE chat_id = $1`,
+		job.ChatID,
+	); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_retry", "error").Inc()
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_retry", "error").Inc()
+		return err
+	}
+
+	dbOperationsTotal.WithLabelValues("mark_notification_retry", "success").Inc()
+	return nil
+}
+
+func (a *App) markNotificationJobFailed(job NotificationJob, sendErr error, permanent bool) error {
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dbCancel()
+
+	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_failed", "error").Inc()
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if _, err := tx.ExecContext(
+		dbCtx,
+		`UPDATE notification_jobs
+		 SET status = 'failed',
+		     failed_at = NOW(),
+		     claimed_until = NULL,
+		     last_error = $2,
+		     updated_at = NOW()
+		 WHERE id = $1`,
+		job.ID,
+		truncateErrorText(sendErr.Error(), 500),
+	); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_failed", "error").Inc()
+		return err
+	}
+
+	if permanent {
+		if _, err := tx.ExecContext(
+			dbCtx,
+			`UPDATE subscribers
+			 SET is_subscribed = FALSE,
+			     cron_claimed_until = NULL
+			 WHERE chat_id = $1`,
+			job.ChatID,
+		); err != nil {
+			dbOperationsTotal.WithLabelValues("mark_notification_failed", "error").Inc()
+			return err
+		}
+	} else {
+		if _, err := tx.ExecContext(
+			dbCtx,
+			`UPDATE subscribers
+			 SET cron_claimed_until = NULL
+			 WHERE chat_id = $1`,
+			job.ChatID,
+		); err != nil {
+			dbOperationsTotal.WithLabelValues("mark_notification_failed", "error").Inc()
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		dbOperationsTotal.WithLabelValues("mark_notification_failed", "error").Inc()
+		return err
+	}
+
+	dbOperationsTotal.WithLabelValues("mark_notification_failed", "success").Inc()
+	return nil
+}
+
 func newTelegramUpdateShards(count, buffer int) []chan tgbotapi.Update {
 	shards := make([]chan tgbotapi.Update, count)
 	for i := range shards {
@@ -899,6 +1261,42 @@ func safeSecretCompare(inputToken, expectedSecret string) bool {
 	return subtle.ConstantTimeCompare([]byte(inputToken), []byte(expectedSecret)) == 1
 }
 
+func (a *App) acquireCronAdvisoryLock(ctx context.Context) (*sql.Conn, bool, error) {
+	conn, err := a.db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var acquired bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, cronAdvisoryLockKey).Scan(&acquired); err != nil {
+		_ = conn.Close()
+		return nil, false, err
+	}
+
+	if !acquired {
+		_ = conn.Close()
+		return nil, false, nil
+	}
+
+	return conn, true, nil
+}
+
+func releaseCronAdvisoryLock(conn *sql.Conn) {
+	if conn == nil {
+		return
+	}
+
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if _, err := conn.ExecContext(releaseCtx, `SELECT pg_advisory_unlock($1)`, cronAdvisoryLockKey); err != nil {
+		slog.Error("failed to release cron advisory lock", "error", err)
+	}
+	if err := conn.Close(); err != nil {
+		slog.Error("failed to close cron advisory lock connection", "error", err)
+	}
+}
+
 func isPermanentTelegramSendError(err error) bool {
 	// Постійні Telegram-помилки означають, що користувач недоступний і його треба відписати від cron-розсилки.
 	var tgErr *tgbotapi.Error
@@ -941,156 +1339,6 @@ func (a *App) markSubscriberUnsubscribed(chatID int64) {
 	dbOperationsTotal.WithLabelValues("mark_unsubscribed", "success").Inc()
 }
 
-func subscriberIDs(subs []Subscriber) []int64 {
-	ids := make([]int64, 0, len(subs))
-	for _, sub := range subs {
-		ids = append(ids, sub.ID)
-	}
-	return ids
-}
-
-func (a *App) claimDueSubscribers(ctx context.Context) ([]Subscriber, error) {
-	dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer dbCancel()
-
-	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
-		return nil, err
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	// У короткій транзакції позначаємо batch у БД і одразу фіксуємо зміни, щоб не тримати row locks під час Telegram API calls.
-	// Cron приходить раз на календарну хвилину, тому due-check і last_sent працюють хвилинними слотами, а не рівно 60 секундами.
-	rows, err := tx.QueryContext(dbCtx, `WITH claim_clock AS (
-		SELECT NOW() AS claimed_at
-	), due AS (
-		SELECT s.chat_id
-		FROM subscribers AS s
-		CROSS JOIN claim_clock
-		WHERE s.is_subscribed = TRUE
-		AND date_trunc('minute', COALESCE(s.last_sent, TIMESTAMPTZ 'epoch')) <= date_trunc('minute', claim_clock.claimed_at) - (COALESCE(s.interval_minutes, 60) * INTERVAL '1 minute')
-		AND (s.cron_claimed_until IS NULL OR s.cron_claimed_until < claim_clock.claimed_at)
-		ORDER BY s.last_sent ASC NULLS FIRST
-		LIMIT $1
-		FOR UPDATE OF s SKIP LOCKED
-	)
-	UPDATE subscribers AS s
-	SET cron_claimed_until = claim_clock.claimed_at + INTERVAL '2 minute'
-	FROM due, claim_clock
-	WHERE s.chat_id = due.chat_id
-	RETURNING s.chat_id, COALESCE(s.language_code, 'ua'), claim_clock.claimed_at`, cronBatchLimit)
-	if err != nil {
-		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
-		return nil, err
-	}
-
-	var subs []Subscriber
-	for rows.Next() {
-		var sub Subscriber
-		if err := rows.Scan(&sub.ID, &sub.Lang, &sub.ClaimedAt); err != nil {
-			_ = rows.Close()
-			dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
-			return nil, err
-		}
-		subs = append(subs, sub)
-	}
-
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		dbOperationsTotal.WithLabelValues("claim_due_subscribers", "error").Inc()
-		return nil, err
-	}
-
-	dbOperationsTotal.WithLabelValues("claim_due_subscribers", "success").Inc()
-	return subs, nil
-}
-
-func (a *App) markCronDeliveriesSent(ids []int64, sentAt time.Time) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	// last_sent оновлюється тільки для реально доставлених повідомлень.
-	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer dbCancel()
-
-	_, err := a.db.ExecContext(
-		dbCtx,
-		"UPDATE subscribers SET last_sent = date_trunc('minute', $2::timestamptz), cron_claimed_until = NULL WHERE chat_id = ANY($1)",
-		any(ids),
-		sentAt,
-	)
-	if err != nil {
-		dbOperationsTotal.WithLabelValues("mark_cron_sent", "error").Inc()
-		return err
-	}
-
-	dbOperationsTotal.WithLabelValues("mark_cron_sent", "success").Inc()
-	return err
-}
-
-func (a *App) releaseCronClaims(ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	// Звільняємо claim-и після batch: тимчасові помилки залишають користувача eligible для наступної спроби.
-	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer dbCancel()
-
-	_, err := a.db.ExecContext(
-		dbCtx,
-		"UPDATE subscribers SET cron_claimed_until = NULL WHERE chat_id = ANY($1)",
-		any(ids),
-	)
-	if err != nil {
-		dbOperationsTotal.WithLabelValues("release_cron_claims", "error").Inc()
-		return err
-	}
-
-	dbOperationsTotal.WithLabelValues("release_cron_claims", "success").Inc()
-	return err
-}
-
-func (a *App) finishCronBatch(collector *SafeIDCollector, allIDs []int64, sentAt time.Time, partial bool, dispatchWG *sync.WaitGroup) {
-	defer a.cronBatchWG.Done()
-	defer a.isCronRunning.Store(false)
-
-	dispatchWG.Wait()
-	slog.Info("cron batch delivery completed", "subscribers", len(allIDs))
-
-	successIDs := collector.FlushIDs()
-	if err := a.markCronDeliveriesSent(successIDs, sentAt); err != nil {
-		cronRunsTotal.WithLabelValues("mark_sent_error").Inc()
-		slog.Error("failed to update timestamps for successful cron deliveries", "error", err)
-		return
-	}
-
-	if err := a.releaseCronClaims(allIDs); err != nil {
-		cronRunsTotal.WithLabelValues("release_claims_error").Inc()
-		slog.Error("failed to release cron claims after dispatch completion", "error", err)
-		return
-	}
-
-	status := "success"
-	if partial {
-		status = "partial_success"
-	}
-	cronRunsTotal.WithLabelValues(status).Inc()
-}
-
 func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	var providedToken string
@@ -1109,10 +1357,17 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !a.isCronRunning.CompareAndSwap(false, true) {
+	lockConn, acquired, err := a.acquireCronAdvisoryLock(r.Context())
+	if err != nil {
+		cronRunsTotal.WithLabelValues("lock_error").Inc()
+		slog.Error("failed to acquire cron advisory lock", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if !acquired {
 		cronRunsTotal.WithLabelValues("conflict").Inc()
 		slog.Warn(
-			"prevented overlapping cron job execution, request discarded",
+			"prevented overlapping cron job execution across replicas, request discarded",
 			"remote_ip",
 			r.RemoteAddr,
 		)
@@ -1120,100 +1375,29 @@ func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("Cron execution already in progress"))
 		return
 	}
-	releaseCronLock := true
-	defer func() {
-		if releaseCronLock {
-			a.isCronRunning.Store(false)
-		}
-	}()
+	defer releaseCronAdvisoryLock(lockConn)
 
-	slog.Info("valid cron trigger received, claiming due subscriber batch")
+	slog.Info("valid cron trigger received, creating durable notification jobs")
 	ctx := r.Context()
 
-	currentTime := time.Now().In(a.kyivLoc).Format("15:04")
-	subs, err := a.claimDueSubscribers(ctx)
+	createdJobs, err := a.createCronNotificationJobs(ctx)
 	if err != nil {
-		cronRunsTotal.WithLabelValues("claim_error").Inc()
-		slog.Error("failed to claim notification target batch", "error", err)
+		cronRunsTotal.WithLabelValues("create_jobs_error").Inc()
+		slog.Error("failed to create durable notification jobs", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	if len(subs) == 0 {
-		cronRunsTotal.WithLabelValues("no_subscribers").Inc()
+	if createdJobs == 0 {
+		cronRunsTotal.WithLabelValues("no_jobs").Inc()
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("No subscribers to notify"))
+		_, _ = w.Write([]byte("No notification jobs created"))
 		return
 	}
 
-	cronClaimedSubscribersTotal.Add(float64(len(subs)))
-	allIDs := subscriberIDs(subs)
-	collector := &SafeIDCollector{ids: make([]int64, 0, len(subs))}
-	var dispatchWG sync.WaitGroup
-	enqueuedJobs := 0
-	enqueueFailed := false
-
-enqueueLoop:
-	for _, s := range subs {
-		pricesTextLocal := a.getFormattedPricesFromCache(s.Lang)
-		header := fmt.Sprintf(getMsgText(s.Lang, "alert_hdr"), currentTime)
-		text := fmt.Sprintf(
-			"%s\n\n%s\n\n_%s_",
-			header,
-			pricesTextLocal,
-			getMsgText(s.Lang, "dynamics"),
-		)
-
-		dispatchWG.Add(1)
-		job := Job{
-			ChatID:    s.ID,
-			Lang:      s.Lang,
-			Text:      text,
-			Collector: collector,
-			DoneFunc:  func() { dispatchWG.Done() },
-		}
-
-		select {
-		case a.cronJobChan <- job:
-			enqueuedJobs++
-		case <-ctx.Done():
-			cronRunsTotal.WithLabelValues("enqueue_canceled").Inc()
-			cronDeliveriesTotal.WithLabelValues("enqueue_canceled").Inc()
-			dispatchWG.Done()
-			slog.Warn("cron enqueue canceled", "chat_id", s.ID)
-			enqueueFailed = true
-			break enqueueLoop
-		case <-time.After(1 * time.Second):
-			cronRunsTotal.WithLabelValues("enqueue_timeout").Inc()
-			cronDeliveriesTotal.WithLabelValues("enqueue_timeout").Inc()
-			dispatchWG.Done()
-			slog.Warn("cron enqueue timed out", "chat_id", s.ID)
-			enqueueFailed = true
-			break enqueueLoop
-		}
-	}
-
-	if enqueuedJobs == 0 {
-		if err := a.releaseCronClaims(allIDs); err != nil {
-			cronRunsTotal.WithLabelValues("release_claims_error").Inc()
-			slog.Error("failed to release cron claims after enqueue failure", "error", err)
-		}
-		cronRunsTotal.WithLabelValues("enqueue_unavailable").Inc()
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("Cron queue is unavailable"))
-		return
-	}
-
-	a.cronBatchWG.Add(1)
-	go a.finishCronBatch(collector, allIDs, subs[0].ClaimedAt, enqueueFailed, &dispatchWG)
-	releaseCronLock = false
-
-	if enqueueFailed {
-		slog.Warn("cron batch accepted with partial enqueue", "claimed", len(subs), "enqueued", enqueuedJobs)
-	} else {
-		slog.Info("cron batch accepted", "claimed", len(subs), "enqueued", enqueuedJobs)
-	}
-
+	cronClaimedSubscribersTotal.Add(float64(createdJobs))
+	cronRunsTotal.WithLabelValues("accepted").Inc()
+	slog.Info("cron batch accepted and durably stored", "jobs", createdJobs)
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte("Cron batch accepted"))
 }
@@ -1586,7 +1770,6 @@ func main() {
 	}
 
 	telegramUpdateShards := newTelegramUpdateShards(telegramShardCount, telegramShardBuffer)
-	cronJobChanInstance := make(chan Job, 5000)
 
 	app := &App{
 		db:                   rawDB,
@@ -1594,7 +1777,6 @@ func main() {
 		priceCache:           &PriceCache{store: make(map[string]PriceEntry)},
 		langCache:            lruCacheInstance,
 		telegramUpdateShards: telegramUpdateShards,
-		cronJobChan:          cronJobChanInstance,
 		kyivLoc:              kyivLocation,
 		httpClient:           customHTTPClient,
 		webhookSecret:        webhookSecretToken,
@@ -1700,19 +1882,16 @@ func main() {
 		for _, updates := range app.telegramUpdateShards {
 			close(updates)
 		}
-		close(app.cronJobChan)
 	} else {
 		slog.Warn("skipping channel close because HTTP producers are still active")
 		stopWorkers()
 	}
 
 	telegramWG.Wait()
-	cronWG.Wait()
 	if producersDrained {
-		app.cronBatchWG.Wait()
-	} else {
-		slog.Warn("skipping cron batch wait because HTTP producers are still active")
+		stopWorkers()
 	}
+	cronWG.Wait()
 	slog.Info("background worker pools stopped")
 
 	rawDB.Close()
