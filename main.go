@@ -174,10 +174,17 @@ const cronBatchLimit = 100
 const telegramShardCount = 20
 const telegramShardBuffer = 50
 
-// Один job може жити довше одного Telegram send, але lease має перекривати
-// весь batch із запасом, щоб другий worker не підхопив той самий рядок зарано.
-const notificationJobClaimWindow = 15 * time.Minute
+// Lease покриває одну Telegram-доставку: 10s HTTP timeout + 5s DB persist timeout із запасом.
+const notificationJobClaimWindow = 45 * time.Second
+const notificationJobPollInterval = 2 * time.Second
 const notificationJobMaxAttempts = 3
+
+// Після вичерпання transient retries робимо паузу, щоб не створювати новий failed job кожну хвилину.
+const notificationFailureCooldown = 15 * time.Minute
+const notificationRetentionCleanupInterval = time.Hour
+const notificationSentRetention = 30 * 24 * time.Hour
+const notificationFailedRetention = 90 * 24 * time.Hour
+const notificationRetentionCleanupLimit = 1000
 const cronAdvisoryLockKey int64 = 0x63726f6e6c6f636b
 
 var (
@@ -410,6 +417,79 @@ func (a *App) startPriceTicker(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (a *App) startNotificationRetentionCleaner(ctx context.Context) {
+	ticker := time.NewTicker(notificationRetentionCleanupInterval)
+	defer ticker.Stop()
+
+	slog.Info("notification job retention cleaner started")
+	a.runNotificationRetentionCleanup(ctx)
+
+	for {
+		select {
+		case <-ticker.C:
+			a.runNotificationRetentionCleanup(ctx)
+		case <-ctx.Done():
+			slog.Info("notification job retention cleaner stopped")
+			return
+		}
+	}
+}
+
+func (a *App) runNotificationRetentionCleanup(ctx context.Context) {
+	deleted, err := a.cleanupNotificationJobHistory(ctx)
+	if err != nil {
+		slog.Error("failed to clean notification job history", "error", err)
+		return
+	}
+
+	if deleted > 0 {
+		slog.Info("notification job history cleaned", "deleted", deleted)
+	}
+}
+
+func (a *App) cleanupNotificationJobHistory(ctx context.Context) (int64, error) {
+	dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer dbCancel()
+
+	result, err := a.db.ExecContext(
+		dbCtx,
+		`WITH expired_jobs AS (
+			SELECT id
+			FROM notification_jobs
+			WHERE (
+				status = 'sent'
+				AND sent_at IS NOT NULL
+				AND sent_at < NOW() - $1::interval
+			) OR (
+				status = 'failed'
+				AND failed_at IS NOT NULL
+				AND failed_at < NOW() - $2::interval
+			)
+			ORDER BY COALESCE(sent_at, failed_at) ASC, id ASC
+			LIMIT $3
+		)
+		DELETE FROM notification_jobs AS nj
+		USING expired_jobs
+		WHERE nj.id = expired_jobs.id`,
+		postgresIntervalString(notificationSentRetention),
+		postgresIntervalString(notificationFailedRetention),
+		notificationRetentionCleanupLimit,
+	)
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("notification_retention_cleanup", "error").Inc()
+		return 0, err
+	}
+
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		dbOperationsTotal.WithLabelValues("notification_retention_cleanup", "error").Inc()
+		return 0, err
+	}
+
+	dbOperationsTotal.WithLabelValues("notification_retention_cleanup", "success").Inc()
+	return deleted, nil
 }
 
 func (a *App) fetchAndCachePrices(ctx context.Context) {
@@ -649,7 +729,7 @@ func (a *App) WarmupCache(ctx context.Context) {
 func (a *App) alertWorker(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	pollTicker := time.NewTicker(250 * time.Millisecond)
+	pollTicker := time.NewTicker(notificationJobPollInterval)
 	defer pollTicker.Stop()
 
 	for {
@@ -731,6 +811,7 @@ func (a *App) createCronNotificationJobs(ctx context.Context) (int, error) {
 		WHERE s.is_subscribed = TRUE
 		AND date_trunc('minute', COALESCE(s.last_sent, TIMESTAMPTZ 'epoch')) <= date_trunc('minute', claim_clock.claimed_at) - (COALESCE(s.interval_minutes, 60) * INTERVAL '1 minute')
 		AND (s.cron_claimed_until IS NULL OR s.cron_claimed_until < claim_clock.claimed_at)
+		AND (s.delivery_suspended_until IS NULL OR s.delivery_suspended_until <= claim_clock.claimed_at)
 		AND NOT EXISTS (
 			SELECT 1
 			FROM notification_jobs AS nj
@@ -946,7 +1027,8 @@ func (a *App) markNotificationJobSent(job NotificationJob) error {
 		dbCtx,
 		`UPDATE subscribers
 		 SET last_sent = date_trunc('minute', $2::timestamptz),
-		     cron_claimed_until = NULL
+		     cron_claimed_until = NULL,
+		     delivery_suspended_until = NULL
 		 WHERE chat_id = $1`,
 		job.ChatID,
 		job.ScheduledAt,
@@ -995,6 +1077,8 @@ func (a *App) markNotificationJobRetry(job NotificationJob, sendErr error) error
 		return err
 	}
 
+	// Retry захищає сам outbox job, тому subscriber claim можна звільнити
+	// і не блокувати майбутні cron cycles довше, ніж потрібно.
 	if _, err := tx.ExecContext(
 		dbCtx,
 		`UPDATE subscribers
@@ -1049,7 +1133,8 @@ func (a *App) markNotificationJobFailed(job NotificationJob, sendErr error, perm
 			dbCtx,
 			`UPDATE subscribers
 			 SET is_subscribed = FALSE,
-			     cron_claimed_until = NULL
+			     cron_claimed_until = NULL,
+			     delivery_suspended_until = NULL
 			 WHERE chat_id = $1`,
 			job.ChatID,
 		); err != nil {
@@ -1060,9 +1145,11 @@ func (a *App) markNotificationJobFailed(job NotificationJob, sendErr error, perm
 		if _, err := tx.ExecContext(
 			dbCtx,
 			`UPDATE subscribers
-			 SET cron_claimed_until = NULL
+			 SET cron_claimed_until = NULL,
+			     delivery_suspended_until = NOW() + $2::interval
 			 WHERE chat_id = $1`,
 			job.ChatID,
+			postgresIntervalString(notificationFailureCooldown),
 		); err != nil {
 			dbOperationsTotal.WithLabelValues("mark_notification_failed", "error").Inc()
 			return err
@@ -1328,7 +1415,7 @@ func (a *App) markSubscriberUnsubscribed(chatID int64) {
 
 	if _, err := a.db.ExecContext(
 		dbCtx,
-		"UPDATE subscribers SET is_subscribed = FALSE, cron_claimed_until = NULL WHERE chat_id = $1",
+		"UPDATE subscribers SET is_subscribed = FALSE, cron_claimed_until = NULL, delivery_suspended_until = NULL WHERE chat_id = $1",
 		chatID,
 	); err != nil {
 		dbOperationsTotal.WithLabelValues("mark_unsubscribed", "error").Inc()
@@ -1628,7 +1715,8 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
                      interval_minutes = COALESCE(subscribers.interval_minutes, EXCLUDED.interval_minutes),
                      last_sent = COALESCE(subscribers.last_sent, EXCLUDED.last_sent),
                      language_code = EXCLUDED.language_code,
-                     is_subscribed = TRUE`, chatID, lang); err != nil {
+                     is_subscribed = TRUE,
+                     delivery_suspended_until = NULL`, chatID, lang); err != nil {
 			dbOperationsTotal.WithLabelValues("subscribe", "error").Inc()
 			slog.Error("subscriber activation failed", "chat_id", chatID, "error", err)
 			a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
@@ -1637,7 +1725,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 		dbOperationsTotal.WithLabelValues("subscribe", "success").Inc()
 		a.sendSafeMessage(chatID, getMsgText(lang, "subscribe"), nil)
 	case "unsubscribe":
-		if _, err := a.db.ExecContext(ctx, "UPDATE subscribers SET is_subscribed = FALSE, cron_claimed_until = NULL WHERE chat_id = $1", chatID); err != nil {
+		if _, err := a.db.ExecContext(ctx, "UPDATE subscribers SET is_subscribed = FALSE, cron_claimed_until = NULL, delivery_suspended_until = NULL WHERE chat_id = $1", chatID); err != nil {
 			dbOperationsTotal.WithLabelValues("unsubscribe", "error").Inc()
 			slog.Error("deactivation sql command failed", "chat_id", chatID, "error", err)
 			a.sendSafeMessage(chatID, getMsgText(lang, "db_err"), nil)
@@ -1791,6 +1879,7 @@ func main() {
 	app.WarmupCache(runCtx)
 
 	go app.startPriceTicker(runCtx)
+	go app.startNotificationRetentionCleaner(runCtx)
 
 	var telegramWG sync.WaitGroup
 	for _, updates := range app.telegramUpdateShards {

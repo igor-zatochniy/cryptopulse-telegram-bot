@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS subscribers (
     last_sent TIMESTAMPTZ,
     language_code TEXT,
     is_subscribed BOOLEAN,
-    cron_claimed_until TIMESTAMPTZ
+    cron_claimed_until TIMESTAMPTZ,
+    delivery_suspended_until TIMESTAMPTZ
 );
 
 ALTER TABLE subscribers
@@ -15,7 +16,8 @@ ALTER TABLE subscribers
     ADD COLUMN IF NOT EXISTS last_sent TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS language_code TEXT,
     ADD COLUMN IF NOT EXISTS is_subscribed BOOLEAN,
-    ADD COLUMN IF NOT EXISTS cron_claimed_until TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS cron_claimed_until TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS delivery_suspended_until TIMESTAMPTZ;
 
 UPDATE subscribers
 SET
@@ -85,8 +87,12 @@ ON subscribers (chat_id);
 
 CREATE INDEX IF NOT EXISTS idx_subscribers_cron_due
 ON subscribers (last_sent ASC NULLS FIRST, cron_claimed_until)
-INCLUDE (chat_id, language_code, interval_minutes)
+INCLUDE (chat_id, language_code, interval_minutes, delivery_suspended_until)
 WHERE is_subscribed = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_subscribers_delivery_suspended_until
+ON subscribers (delivery_suspended_until)
+WHERE is_subscribed = TRUE AND delivery_suspended_until IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS market_prices (
     symbol TEXT,
@@ -171,5 +177,13 @@ WHERE status IN ('pending', 'sending');
 
 CREATE INDEX IF NOT EXISTS idx_notification_jobs_chat_status
 ON notification_jobs (chat_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_notification_jobs_sent_retention
+ON notification_jobs (sent_at)
+WHERE status = 'sent' AND sent_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_notification_jobs_failed_retention
+ON notification_jobs (failed_at)
+WHERE status = 'failed' AND failed_at IS NOT NULL;
 
 COMMIT;

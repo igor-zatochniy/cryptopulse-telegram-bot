@@ -435,7 +435,7 @@ func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
 	assertSubscribed(t, db, 301, true)
 
 	assertLastSentUnchanged(t, db, 302, oldLastSent)
-	assertClaimActive(t, db, 302)
+	assertClaimCleared(t, db, 302)
 	assertSubscribed(t, db, 302, true)
 
 	assertLastSentUnchanged(t, db, 303, oldLastSent)
@@ -539,6 +539,97 @@ func TestIntegrationCronRecordsClaimMinuteAsLastSent(t *testing.T) {
 	assertClaimCleared(t, db, chatID)
 }
 
+func TestIntegrationExhaustedTransientFailureSuspendsSubscriber(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, func(chatID int64) fakeTelegramResponse {
+		return fakeTelegramResponse{
+			OK:          false,
+			ErrorCode:   http.StatusTooManyRequests,
+			Description: "Too Many Requests: retry later",
+		}
+	})
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 306
+	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
+	insertSubscriber(t, db, chatID, true, 1, "ua", oldLastSent)
+
+	created, err := app.createCronNotificationJobs(context.Background())
+	if err != nil {
+		t.Fatalf("create cron notification jobs: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created jobs = %d, want 1", created)
+	}
+
+	for attempt := 1; attempt <= notificationJobMaxAttempts; attempt++ {
+		job, err := app.claimPendingNotificationJob(context.Background())
+		if err != nil {
+			t.Fatalf("claim notification job attempt %d: %v", attempt, err)
+		}
+		if job == nil {
+			t.Fatalf("claim notification job attempt %d returned nil", attempt)
+		}
+
+		app.processNotificationJob(*job)
+
+		if attempt < notificationJobMaxAttempts {
+			if _, err := db.Exec(
+				"UPDATE notification_jobs SET next_attempt_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+				job.ID,
+			); err != nil {
+				t.Fatalf("advance retry attempt %d: %v", attempt, err)
+			}
+		}
+	}
+
+	failedJob := waitForNotificationJobStatus(t, db, chatID, "failed")
+	if failedJob.Attempts != notificationJobMaxAttempts {
+		t.Fatalf("failed job attempts = %d, want %d", failedJob.Attempts, notificationJobMaxAttempts)
+	}
+
+	assertLastSentUnchanged(t, db, chatID, oldLastSent)
+	assertClaimCleared(t, db, chatID)
+	assertDeliverySuspended(t, db, chatID)
+
+	createdAgain, err := app.createCronNotificationJobs(context.Background())
+	if err != nil {
+		t.Fatalf("create cron notification jobs after suspension: %v", err)
+	}
+	if createdAgain != 0 {
+		t.Fatalf("created jobs after suspension = %d, want 0", createdAgain)
+	}
+	assertNotificationJobCount(t, db, chatID, 1)
+}
+
+func TestIntegrationNotificationJobRetentionCleanup(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	insertNotificationJobForRetention(t, db, 701, "sent", time.Now().Add(-31*24*time.Hour), sql.NullTime{})
+	insertNotificationJobForRetention(t, db, 702, "sent", time.Now().Add(-29*24*time.Hour), sql.NullTime{})
+	insertNotificationJobForRetention(t, db, 703, "failed", time.Now().Add(-91*24*time.Hour), sql.NullTime{})
+	insertNotificationJobForRetention(t, db, 704, "failed", time.Now().Add(-89*24*time.Hour), sql.NullTime{})
+	insertNotificationJobForRetention(t, db, 705, "pending", time.Now().Add(-120*24*time.Hour), sql.NullTime{})
+	insertNotificationJobForRetention(t, db, 706, "sending", time.Now().Add(-120*24*time.Hour), sql.NullTime{Time: time.Now().Add(-1 * time.Hour), Valid: true})
+
+	deleted, err := app.cleanupNotificationJobHistory(context.Background())
+	if err != nil {
+		t.Fatalf("cleanup notification job history: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted jobs = %d, want 2", deleted)
+	}
+
+	assertNoNotificationJobs(t, db, 701)
+	assertNotificationJobCount(t, db, 702, 1)
+	assertNoNotificationJobs(t, db, 703)
+	assertNotificationJobCount(t, db, 704, 1)
+	assertNotificationJobCount(t, db, 705, 1)
+	assertNotificationJobCount(t, db, 706, 1)
+}
+
 func TestIntegrationCronUsesPostgresAdvisoryLock(t *testing.T) {
 	db := setupIntegrationDB(t)
 	bot := newFakeTelegramBot(t, nil)
@@ -596,6 +687,44 @@ func insertSubscriber(t *testing.T, db *sql.DB, chatID int64, subscribed bool, i
 	)
 	if err != nil {
 		t.Fatalf("insert subscriber %d: %v", chatID, err)
+	}
+}
+
+func insertNotificationJobForRetention(t *testing.T, db *sql.DB, chatID int64, status string, terminalAt time.Time, claimedUntil sql.NullTime) {
+	t.Helper()
+
+	var sentAt sql.NullTime
+	var failedAt sql.NullTime
+	switch status {
+	case "sent":
+		sentAt = sql.NullTime{Time: terminalAt, Valid: true}
+	case "failed":
+		failedAt = sql.NullTime{Time: terminalAt, Valid: true}
+	}
+
+	_, err := db.Exec(
+		`INSERT INTO notification_jobs (
+			chat_id,
+			language_code,
+			message_text,
+			scheduled_at,
+			status,
+			attempts,
+			claimed_until,
+			next_attempt_at,
+			sent_at,
+			failed_at,
+			last_error
+		) VALUES ($1, 'ua', 'retention test', $2, $3, 1, $4, NOW(), $5, $6, 'retention test error')`,
+		chatID,
+		terminalAt,
+		status,
+		claimedUntil,
+		sentAt,
+		failedAt,
+	)
+	if err != nil {
+		t.Fatalf("insert notification job %d/%s: %v", chatID, status, err)
 	}
 }
 
@@ -702,6 +831,21 @@ func assertClaimCleared(t *testing.T, db *sql.DB, chatID int64) {
 	}
 }
 
+func assertDeliverySuspended(t *testing.T, db *sql.DB, chatID int64) {
+	t.Helper()
+
+	var suspendedUntil sql.NullTime
+	if err := db.QueryRow("SELECT delivery_suspended_until FROM subscribers WHERE chat_id = $1", chatID).Scan(&suspendedUntil); err != nil {
+		t.Fatalf("select delivery suspension %d: %v", chatID, err)
+	}
+	if !suspendedUntil.Valid {
+		t.Fatalf("subscriber %d delivery_suspended_until is NULL", chatID)
+	}
+	if !suspendedUntil.Time.After(time.Now().Add(-1 * time.Second)) {
+		t.Fatalf("subscriber %d delivery_suspended_until = %s, want future time", chatID, suspendedUntil.Time)
+	}
+}
+
 func assertClaimActive(t *testing.T, db *sql.DB, chatID int64) {
 	t.Helper()
 
@@ -804,12 +948,18 @@ func selectNotificationJobState(t *testing.T, db *sql.DB, chatID int64) (notific
 func assertNoNotificationJobs(t *testing.T, db *sql.DB, chatID int64) {
 	t.Helper()
 
+	assertNotificationJobCount(t, db, chatID, 0)
+}
+
+func assertNotificationJobCount(t *testing.T, db *sql.DB, chatID int64, want int) {
+	t.Helper()
+
 	var count int
 	if err := db.QueryRow("SELECT COUNT(*) FROM notification_jobs WHERE chat_id = $1", chatID).Scan(&count); err != nil {
 		t.Fatalf("count notification jobs %d: %v", chatID, err)
 	}
-	if count != 0 {
-		t.Fatalf("notification jobs for chat %d = %d, want 0", chatID, count)
+	if count != want {
+		t.Fatalf("notification jobs for chat %d = %d, want %d", chatID, count, want)
 	}
 }
 

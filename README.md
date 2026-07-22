@@ -148,6 +148,8 @@ psql "$DATABASE_URL" -f migrations/001_init_schema.sql
 - перевірки interval і language
 - cron query indexes
 - `cron_claimed_until` для коротких database claims
+- `delivery_suspended_until` для cooldown після exhausted transient delivery failures
+- retention indexes для очищення старих `notification_jobs`
 
 ## Локальна розробка
 
@@ -250,6 +252,9 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 - Cron jobs створюються як durable rows у PostgreSQL outbox.
 - Telegram sends виконуються поза database transactions.
 - Успішні sends оновлюють `last_sent`; невдалі sends не оновлюють.
+- Transient retry очищає subscriber claim, але pending outbox job не дозволяє створити duplicate notification.
+- Після вичерпання transient retry attempts підписник тимчасово призупиняється через `delivery_suspended_until`.
+- Outbox retention видаляє `sent` jobs після 30 днів, а `failed` jobs після 90 днів; `pending` і `sending` jobs не видаляються.
 - HTTP producers відстежуються через `WaitGroup` під час shutdown.
 - Після зупинки producers worker pools дочитують закриті канали, щоб не губити вже прийняті Telegram updates; cron jobs залишаються durable в PostgreSQL outbox.
 - Context cancellation використовується як forced fallback, якщо producers не вдалося зупинити вчасно.

@@ -218,7 +218,9 @@ go test -tags=integration ./...
 - cron claim/release;
 - оновлення `last_sent` тільки після успішної Telegram-доставки;
 - permanent Telegram error -> unsubscribe;
-- transient Telegram error -> retry later без оновлення `last_sent`.
+- transient Telegram error -> retry later без оновлення `last_sent`;
+- exhausted transient errors -> тимчасовий cooldown через `delivery_suspended_until`.
+- notification outbox retention: `sent` jobs 30 днів, `failed` jobs 90 днів.
 
 ## Cron
 
@@ -307,7 +309,13 @@ cryptopulse_telegram_send_errors_total
 5. Перевірити subscribers:
 
 ```bash
-sudo -u postgres psql -d <database_name> -c "SELECT chat_id, interval_minutes, last_sent, is_subscribed, cron_claimed_until FROM subscribers ORDER BY last_sent ASC LIMIT 20;"
+sudo -u postgres psql -d <database_name> -c "SELECT chat_id, interval_minutes, last_sent, is_subscribed, cron_claimed_until, delivery_suspended_until FROM subscribers ORDER BY last_sent ASC LIMIT 20;"
+```
+
+6. Перевірити outbox backlog і retention:
+
+```bash
+sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM notification_jobs GROUP BY status ORDER BY status;"
 ```
 
 ### Telegram Webhook Does Not Work
@@ -402,8 +410,6 @@ nc -vz <hetzner_server_ip> 5432
 
 Наступні покращення для більшого масштабу:
 
-- persistent outbox для Telegram delivery;
-- integration tests із PostgreSQL;
 - окремий `METRICS_SECRET`;
 - static egress/private networking для Koyeb-to-PostgreSQL;
 - automated backup schedule.
