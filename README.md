@@ -50,6 +50,7 @@ Production-орієнтований Telegram-сервіс на Go. Він від
 - Заплановані сповіщення про ціни криптовалют через автентифікований endpoint `/cron`.
 - Кеш актуальних цін на основі Binance ticker requests із збереженням у PostgreSQL.
 - Стан підписників у PostgreSQL зі schema migration, defaults, constraints та indexes.
+- Durable inbox для Telegram webhook updates з idempotency через `update_id`.
 - Повідомлення бота українською, англійською та російською мовами.
 - JSON structured logs через `log/slog`.
 - Prometheus-метрики за Bearer authentication.
@@ -64,7 +65,7 @@ flowchart LR
     Telegram["Telegram Webhook"] -->|POST /webhook| App["Go Bot Service"]
     Cron["cron-job.org / Scheduler"] -->|POST /cron + Bearer token| App
     App -->|Ticker requests| Binance["Binance API"]
-    App -->|SQL queries| Postgres["PostgreSQL"]
+    App -->|Inbox / Outbox / SQL queries| Postgres["PostgreSQL"]
     App -->|Send messages| TelegramAPI["Telegram Bot API"]
     App -->|GET /metrics + Bearer token| Metrics["Prometheus Metrics"]
     App -->|GET /live, /ready| Health["Health Checks"]
@@ -88,7 +89,7 @@ flowchart LR
 .
 ├── .github/workflows/ci.yml      # CI: tests, vet, race, lint, govulncheck, Docker build, gitleaks
 ├── docs/operations.md            # Production runbook для деплою, DB, firewall і incident response
-├── migrations/001_init_schema.sql # PostgreSQL-схема та індекси
+├── migrations/*.sql               # Versioned Goose migrations для PostgreSQL
 ├── Dockerfile                    # Multi-stage production image
 ├── main.go                       # Точка входу застосунку та сервісна логіка
 ├── main_test.go                  # Regression tests для middleware/auth behavior
@@ -107,7 +108,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | `/live` | `GET` | none | Liveness check. Не звертається до зовнішніх залежностей. |
 | `/ready` | `GET` | none | Readiness check. Перевіряє підключення до PostgreSQL. |
-| `/webhook` | `POST` | `X-Telegram-Bot-Api-Secret-Token` | Endpoint для Telegram updates. |
+| `/webhook` | `POST` | `X-Telegram-Bot-Api-Secret-Token` | Зберігає Telegram update у durable inbox перед `200 OK`. |
 | `/cron` | `POST` | `Authorization: Bearer <CRON_SECRET>` | Забирає due subscribers і надсилає заплановані сповіщення. |
 | `/metrics` | `GET` | `Authorization: Bearer <CRON_SECRET>` | Prometheus metrics. |
 
@@ -131,25 +132,33 @@ cp .env.example .env
 
 Ніколи не комітьте реальні `.env` файли або production secrets.
 
-## Міграція бази даних
+## Міграції бази даних
 
-Застосуйте схему перед деплоєм нової версії сервісу:
+Проєкт використовує `goose`. Застосовані migration-файли не редагуються після деплою; кожна нова зміна схеми отримує наступний номер.
+
+Встановіть CLI:
 
 ```bash
-psql "$DATABASE_URL" -f migrations/001_init_schema.sql
+go install github.com/pressly/goose/v3/cmd/goose@v3.25.0
 ```
 
-Міграція створює та посилює:
+Перевірте статус і застосуйте міграції перед деплоєм нової версії сервісу:
 
-- `subscribers`
-- `market_prices`
-- unique indexes для `chat_id` і `symbol`
-- defaults і `NOT NULL` constraints
-- перевірки interval і language
-- cron query indexes
-- `cron_claimed_until` для коротких database claims
-- `delivery_suspended_until` для cooldown після exhausted transient delivery failures
-- retention indexes для очищення старих `notification_jobs`
+```bash
+goose -dir migrations postgres "$DATABASE_URL" status
+goose -dir migrations postgres "$DATABASE_URL" up
+```
+
+Якщо production DB раніше вже отримала схему через старий ручний запуск SQL, все одно запускайте `goose up` після backup. Міграції написані з `IF NOT EXISTS` там, де це безпечно, і зафіксують стан у таблиці версій `goose_db_version`.
+
+Поточний набір міграцій:
+
+- `001_init_schema.sql` створює базові таблиці `subscribers` і `market_prices`, defaults, constraints та індекси.
+- `002_add_notification_outbox.sql` додає durable outbox для cron delivery.
+- `003_add_delivery_cooldown.sql` додає cooldown після exhausted transient delivery failures.
+- `004_add_outbox_retention.sql` додає retention indexes для очищення старих outbox jobs.
+- `005_add_telegram_update_inbox.sql` додає durable inbox для Telegram webhook updates.
+- `006_add_job_claim_token.sql` додає ownership token і unique active-job invariant для notification workers.
 
 ## Локальна розробка
 
@@ -193,6 +202,7 @@ GitHub Actions запускається на кожен push і pull request:
 - `go vet ./...`
 - `go test -race ./...`
 - `go test -tags=integration ./...`
+- застосування `goose` migrations до чистого PostgreSQL
 - `govulncheck`
 - `golangci-lint v2.12.0`
 - Docker build
@@ -241,6 +251,7 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 - Telegram webhook requests потребують `WEBHOOK_SECRET_TOKEN`.
 - Cron і metrics endpoints потребують Bearer authentication.
 - Тіло webhook request має обмеження за розміром.
+- Webhook повертає `200 OK` тільки після збереження update у PostgreSQL.
 - HTTP methods явно перевіряються.
 - Cron має глобальний rate limit, а webhook обмежується окремо для кожного remote client.
 - PostgreSQL не має бути відкритим у public internet. У production обмежуйте `5432/tcp` trusted egress IPs, private networking або VPN.
@@ -250,13 +261,20 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 
 - Вибір cron subscribers використовує короткі database claims із `FOR UPDATE SKIP LOCKED`.
 - Cron jobs створюються як durable rows у PostgreSQL outbox.
+- Telegram webhook updates створюються як durable rows у PostgreSQL inbox.
+- Duplicate webhook delivery не створює повторну роботу завдяки унікальному `update_id`.
+- Notification workers отримують `claim_token`; stale worker не може завершити job після повторного claim іншим worker.
+- Завершення inbox/outbox job перевіряє поточний claim state, тому stale worker не може перезаписати результат свіжого claim.
+- Для одного Telegram chat зберігається FIFO processing між replicas через SQL claim rule і PostgreSQL advisory lock.
+- Мова користувача читається з PostgreSQL під час обробки update, без локального per-replica cache.
 - Telegram sends виконуються поза database transactions.
 - Успішні sends оновлюють `last_sent`; невдалі sends не оновлюють.
 - Transient retry очищає subscriber claim, але pending outbox job не дозволяє створити duplicate notification.
 - Після вичерпання transient retry attempts підписник тимчасово призупиняється через `delivery_suspended_until`.
 - Outbox retention видаляє `sent` jobs після 30 днів, а `failed` jobs після 90 днів; `pending` і `sending` jobs не видаляються.
+- Inbox retention видаляє `processed` updates після 7 днів, а `failed` updates після 30 днів; `pending` і `processing` updates не видаляються.
 - HTTP producers відстежуються через `WaitGroup` під час shutdown.
-- Після зупинки producers worker pools дочитують закриті канали, щоб не губити вже прийняті Telegram updates; cron jobs залишаються durable в PostgreSQL outbox.
+- Після зупинки producers worker pools завершують активні jobs; незавершені inbox/outbox rows повторно підхоплюються після lease timeout.
 - Context cancellation використовується як forced fallback, якщо producers не вдалося зупинити вчасно.
 
 ## Ключові Інженерні Рішення

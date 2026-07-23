@@ -3,9 +3,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,7 +19,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
@@ -183,12 +185,11 @@ func setupIntegrationDB(t *testing.T) *sql.DB {
 		t.Fatalf("ping postgres: %v", err)
 	}
 
-	migration, err := os.ReadFile("migrations/001_init_schema.sql")
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
+	if err := goose.SetDialect("postgres"); err != nil {
+		t.Fatalf("set goose dialect: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, string(migration)); err != nil {
-		t.Fatalf("apply migration: %v", err)
+	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
+		t.Fatalf("apply migrations: %v", err)
 	}
 
 	return db
@@ -207,21 +208,14 @@ func skipOrFailUnavailableTestcontainer(t *testing.T, err error) {
 func newIntegrationApp(t *testing.T, db *sql.DB, bot *tgbotapi.BotAPI) *App {
 	t.Helper()
 
-	cache, err := lru.New[int64, string](1000)
-	if err != nil {
-		t.Fatalf("create language cache: %v", err)
-	}
-
 	app := &App{
-		db:                   db,
-		bot:                  bot,
-		priceCache:           &PriceCache{store: make(map[string]PriceEntry)},
-		langCache:            cache,
-		telegramUpdateShards: newTelegramUpdateShards(telegramShardCount, telegramShardBuffer),
-		kyivLoc:              time.UTC,
-		httpClient:           http.DefaultClient,
-		webhookSecret:        "webhook-secret",
-		cronSecret:           "cron-secret",
+		db:            db,
+		bot:           bot,
+		priceCache:    &PriceCache{store: make(map[string]PriceEntry)},
+		kyivLoc:       time.UTC,
+		httpClient:    http.DefaultClient,
+		webhookSecret: "webhook-secret",
+		cronSecret:    "cron-secret",
 	}
 
 	for _, coin := range trackedCoins {
@@ -262,6 +256,29 @@ func TestIntegrationSubscribeAfterLanguageSelection(t *testing.T) {
 
 	assertSubscriberState(t, db, chatID, true, 60, "en")
 	assertClaimCleared(t, db, chatID)
+}
+
+func TestIntegrationLanguageLookupReadsCurrentDatabaseAcrossReplicas(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	appA := newIntegrationApp(t, db, bot)
+	appB := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 102
+
+	if err := appA.processTelegramUpdate(context.Background(), languageCallbackUpdate(chatID, "set-language-en", "setlang_en")); err != nil {
+		t.Fatalf("set language to en: %v", err)
+	}
+	if got := appB.getLang(context.Background(), chatID); got != "en" {
+		t.Fatalf("replica B language after first change = %q, want en", got)
+	}
+
+	if err := appA.processTelegramUpdate(context.Background(), languageCallbackUpdate(chatID, "set-language-ru", "setlang_ru")); err != nil {
+		t.Fatalf("set language to ru: %v", err)
+	}
+	if got := appB.getLang(context.Background(), chatID); got != "ru" {
+		t.Fatalf("replica B language after second change = %q, want ru", got)
+	}
 }
 
 func TestIntegrationIntervalRequiresSubscriptionAndUpdatesSubscribedUser(t *testing.T) {
@@ -308,62 +325,209 @@ func TestIntegrationIntervalRequiresSubscriptionAndUpdatesSubscribedUser(t *test
 	}
 }
 
-func TestIntegrationTelegramWorkersPreserveSameChatOrder(t *testing.T) {
+func TestIntegrationWebhookPersistsUpdateBeforeAck(t *testing.T) {
 	db := setupIntegrationDB(t)
 	bot := newFakeTelegramBot(t, nil)
 	app := newIntegrationApp(t, db, bot)
 
-	const chatID int64 = 306
+	update := commandUpdateWithID(30001, 301, "/subscribe")
+	payload, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("marshal webhook update: %v", err)
+	}
 
-	firstStarted := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	var once sync.Once
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+	req.Header.Set("X-Telegram-Bot-Api-Secret-Token", "webhook-secret")
+	rec := httptest.NewRecorder()
 
-	app.beforeTelegramUpdate = func(ctx context.Context, update tgbotapi.Update) {
-		if update.Message == nil || update.Message.Text != "/subscribe" {
-			return
-		}
+	app.handleWebhook(rec, req)
 
-		once.Do(func() {
-			close(firstStarted)
-		})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("webhook status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	assertTelegramUpdateStatus(t, db, 30001, "pending")
+	assertNoSubscriberRow(t, db, 301)
+}
 
-		select {
-		case <-releaseFirst:
-		case <-ctx.Done():
+func TestIntegrationWebhookDuplicateUpdateIDIsIdempotent(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	update := commandUpdateWithID(30003, 303, "/subscribe")
+	payload, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("marshal webhook update: %v", err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+		req.Header.Set("X-Telegram-Bot-Api-Secret-Token", "webhook-secret")
+		rec := httptest.NewRecorder()
+
+		app.handleWebhook(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook duplicate attempt %d status = %d, body = %q", attempt, rec.Code, rec.Body.String())
 		}
 	}
+
+	assertTelegramUpdateStatus(t, db, 30003, "pending")
+	assertTelegramUpdateRowCount(t, db, 30003, 1)
+	assertNoSubscriberRow(t, db, 303)
+}
+
+func TestIntegrationTelegramUpdateWorkerProcessesDurableInbox(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 304
+	update := commandUpdateWithID(30002, chatID, "/subscribe")
+	saveIntegrationTelegramUpdate(t, app, update)
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	var workerWG sync.WaitGroup
-	for _, updates := range app.telegramUpdateShards {
-		workerWG.Add(1)
-		go app.updateWorker(runCtx, &workerWG, updates)
-	}
+	workerWG.Add(1)
+	go app.updateWorker(runCtx, &workerWG, telegramShardIndex(chatID, telegramUpdateWorkerCount))
 	t.Cleanup(func() {
 		cancel()
-		for _, updates := range app.telegramUpdateShards {
-			close(updates)
-		}
 		workerWG.Wait()
 	})
 
-	if !app.enqueueTelegramUpdate(context.Background(), commandUpdate(chatID, "/subscribe")) {
-		t.Fatal("enqueue subscribe update")
+	waitForSubscribed(t, db, chatID, true)
+	waitForTelegramUpdateStatus(t, db, 30002, "processed")
+}
+
+func TestIntegrationTelegramInboxClaimsPreserveSameChatOrderAcrossReplicas(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	appA := newIntegrationApp(t, db, bot)
+	appB := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 306
+	const firstUpdateID int64 = 31001
+	const secondUpdateID int64 = 31002
+
+	saveIntegrationTelegramUpdate(t, appA, commandUpdateWithID(int(firstUpdateID), chatID, "/subscribe"))
+	saveIntegrationTelegramUpdate(t, appA, commandUpdateWithID(int(secondUpdateID), chatID, "/unsubscribe"))
+
+	shardID := telegramShardIndex(chatID, telegramUpdateWorkerCount)
+	firstJob, err := appA.claimPendingTelegramUpdate(context.Background(), shardID)
+	if err != nil {
+		t.Fatalf("claim first telegram update: %v", err)
+	}
+	if firstJob == nil {
+		t.Fatal("first telegram update claim returned nil")
+	}
+	if firstJob.UpdateID != firstUpdateID {
+		t.Fatalf("first claimed update = %d, want %d", firstJob.UpdateID, firstUpdateID)
+	}
+	assertTelegramUpdateStatus(t, db, firstUpdateID, "processing")
+	assertTelegramUpdateStatus(t, db, secondUpdateID, "pending")
+
+	secondJob, err := appB.claimPendingTelegramUpdate(context.Background(), shardID)
+	if err != nil {
+		t.Fatalf("claim second telegram update while first is processing: %v", err)
+	}
+	if secondJob != nil {
+		t.Fatalf("second replica claimed update %d while earlier update %d is still processing", secondJob.UpdateID, firstUpdateID)
 	}
 
-	select {
-	case <-firstStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("subscribe update did not start")
+	if err := appA.markTelegramUpdateProcessed(*firstJob); err != nil {
+		t.Fatalf("mark first telegram update processed: %v", err)
 	}
 
-	if !app.enqueueTelegramUpdate(context.Background(), commandUpdate(chatID, "/unsubscribe")) {
-		t.Fatal("enqueue unsubscribe update")
+	secondJob, err = appB.claimPendingTelegramUpdate(context.Background(), shardID)
+	if err != nil {
+		t.Fatalf("claim second telegram update after first is processed: %v", err)
+	}
+	if secondJob == nil {
+		t.Fatal("second telegram update claim returned nil after first was processed")
+	}
+	if secondJob.UpdateID != secondUpdateID {
+		t.Fatalf("second claimed update = %d, want %d", secondJob.UpdateID, secondUpdateID)
+	}
+}
+
+func TestIntegrationTelegramChatAdvisoryLockBlocksSameChatAcrossReplicas(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	appA := newIntegrationApp(t, db, bot)
+	appB := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 307
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	lockConn, lockKey, err := appA.acquireTelegramChatAdvisoryLock(lockCtx, chatID)
+	lockCancel()
+	if err != nil {
+		t.Fatalf("acquire first chat advisory lock: %v", err)
 	}
 
-	close(releaseFirst)
-	waitForSubscribed(t, db, chatID, false)
+	lockHeld := true
+	t.Cleanup(func() {
+		if lockHeld {
+			releaseTelegramChatAdvisoryLock(lockConn, lockKey)
+		}
+	})
+
+	blockedCtx, blockedCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	blockedConn, blockedKey, err := appB.acquireTelegramChatAdvisoryLock(blockedCtx, chatID)
+	blockedCancel()
+	if err == nil {
+		releaseTelegramChatAdvisoryLock(blockedConn, blockedKey)
+		t.Fatal("second replica acquired the same chat advisory lock while first replica still held it")
+	}
+
+	releaseTelegramChatAdvisoryLock(lockConn, lockKey)
+	lockHeld = false
+
+	freeCtx, freeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	nextConn, nextKey, err := appB.acquireTelegramChatAdvisoryLock(freeCtx, chatID)
+	freeCancel()
+	if err != nil {
+		t.Fatalf("acquire chat advisory lock after release: %v", err)
+	}
+	releaseTelegramChatAdvisoryLock(nextConn, nextKey)
+}
+
+func TestIntegrationStaleTelegramUpdateClaimCannotMarkProcessed(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 308
+	const updateID int64 = 32001
+
+	saveIntegrationTelegramUpdate(t, app, commandUpdateWithID(int(updateID), chatID, "/subscribe"))
+
+	job, err := app.claimPendingTelegramUpdate(context.Background(), telegramShardIndex(chatID, telegramUpdateWorkerCount))
+	if err != nil {
+		t.Fatalf("claim telegram update: %v", err)
+	}
+	if job == nil {
+		t.Fatal("claim telegram update returned nil")
+	}
+
+	if _, err := db.Exec(
+		`UPDATE telegram_updates
+		 SET attempts = attempts + 1,
+		     claimed_until = NOW() + INTERVAL '45 seconds',
+		     updated_at = NOW()
+		 WHERE update_id = $1`,
+		updateID,
+	); err != nil {
+		t.Fatalf("simulate newer telegram update claim: %v", err)
+	}
+
+	err = app.markTelegramUpdateProcessed(*job)
+	if !errors.Is(err, errJobOwnershipLost) {
+		t.Fatalf("mark stale telegram update processed error = %v, want %v", err, errJobOwnershipLost)
+	}
+
+	assertTelegramUpdateStatus(t, db, updateID, "processing")
+	assertTelegramUpdateAttempts(t, db, updateID, job.Attempts+1)
 }
 
 func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
@@ -539,6 +703,62 @@ func TestIntegrationCronRecordsClaimMinuteAsLastSent(t *testing.T) {
 	assertClaimCleared(t, db, chatID)
 }
 
+func TestIntegrationStaleNotificationClaimCannotMarkSent(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 305
+	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
+	insertSubscriber(t, db, chatID, true, 1, "ua", oldLastSent)
+
+	created, err := app.createCronNotificationJobs(context.Background())
+	if err != nil {
+		t.Fatalf("create cron notification jobs: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created jobs = %d, want 1", created)
+	}
+
+	job, err := app.claimPendingNotificationJob(context.Background())
+	if err != nil {
+		t.Fatalf("claim notification job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("claim notification job returned nil")
+	}
+	if job.ClaimToken == "" {
+		t.Fatal("claimed notification job has empty claim token")
+	}
+
+	if _, err := db.Exec(
+		`UPDATE notification_jobs
+		 SET attempts = attempts + 1,
+		     claim_token = gen_random_uuid(),
+		     claimed_until = NOW() + INTERVAL '45 seconds',
+		     updated_at = NOW()
+		 WHERE id = $1`,
+		job.ID,
+	); err != nil {
+		t.Fatalf("simulate newer notification claim: %v", err)
+	}
+
+	err = app.markNotificationJobSent(*job)
+	if !errors.Is(err, errJobOwnershipLost) {
+		t.Fatalf("mark stale notification job sent error = %v, want %v", err, errJobOwnershipLost)
+	}
+
+	state := waitForNotificationJobStatus(t, db, chatID, "sending")
+	if state.Attempts != job.Attempts+1 {
+		t.Fatalf("notification job attempts = %d, want %d", state.Attempts, job.Attempts+1)
+	}
+	if !state.ClaimToken.Valid || state.ClaimToken.String == job.ClaimToken {
+		t.Fatalf("notification job claim_token was not replaced by newer claim")
+	}
+	assertLastSentUnchanged(t, db, chatID, oldLastSent)
+	assertClaimActive(t, db, chatID)
+}
+
 func TestIntegrationExhaustedTransientFailureSuspendsSubscriber(t *testing.T) {
 	db := setupIntegrationDB(t)
 	bot := newFakeTelegramBot(t, func(chatID int64) fakeTelegramResponse {
@@ -628,6 +848,56 @@ func TestIntegrationNotificationJobRetentionCleanup(t *testing.T) {
 	assertNotificationJobCount(t, db, 704, 1)
 	assertNotificationJobCount(t, db, 705, 1)
 	assertNotificationJobCount(t, db, 706, 1)
+}
+
+func TestIntegrationNotificationJobsAllowOnlyOneActiveJobPerChat(t *testing.T) {
+	db := setupIntegrationDB(t)
+
+	const chatID int64 = 707
+	insertNotificationJobForRetention(t, db, chatID, "pending", time.Now(), sql.NullTime{})
+
+	_, err := db.Exec(
+		`INSERT INTO notification_jobs (
+			chat_id,
+			language_code,
+			message_text,
+			scheduled_at,
+			status,
+			next_attempt_at
+		) VALUES ($1, 'ua', 'duplicate active job', NOW(), 'pending', NOW())`,
+		chatID,
+	)
+	if err == nil {
+		t.Fatal("second active notification job for one chat was inserted, want unique constraint error")
+	}
+}
+
+func TestIntegrationTelegramUpdateRetentionCleanup(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	insertTelegramUpdateForRetention(t, db, 801, "processed", time.Now().Add(-8*24*time.Hour), sql.NullTime{})
+	insertTelegramUpdateForRetention(t, db, 802, "processed", time.Now().Add(-6*24*time.Hour), sql.NullTime{})
+	insertTelegramUpdateForRetention(t, db, 803, "failed", time.Now().Add(-31*24*time.Hour), sql.NullTime{})
+	insertTelegramUpdateForRetention(t, db, 804, "failed", time.Now().Add(-29*24*time.Hour), sql.NullTime{})
+	insertTelegramUpdateForRetention(t, db, 805, "pending", time.Now().Add(-60*24*time.Hour), sql.NullTime{})
+	insertTelegramUpdateForRetention(t, db, 806, "processing", time.Now().Add(-60*24*time.Hour), sql.NullTime{Time: time.Now().Add(-1 * time.Hour), Valid: true})
+
+	deleted, err := app.cleanupTelegramUpdateHistory(context.Background())
+	if err != nil {
+		t.Fatalf("cleanup telegram update history: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted updates = %d, want 2", deleted)
+	}
+
+	assertNoTelegramUpdate(t, db, 801)
+	assertTelegramUpdateStatus(t, db, 802, "processed")
+	assertNoTelegramUpdate(t, db, 803)
+	assertTelegramUpdateStatus(t, db, 804, "failed")
+	assertTelegramUpdateStatus(t, db, 805, "pending")
+	assertTelegramUpdateStatus(t, db, 806, "processing")
 }
 
 func TestIntegrationCronUsesPostgresAdvisoryLock(t *testing.T) {
@@ -728,8 +998,58 @@ func insertNotificationJobForRetention(t *testing.T, db *sql.DB, chatID int64, s
 	}
 }
 
+func insertTelegramUpdateForRetention(
+	t *testing.T,
+	db *sql.DB,
+	updateID int64,
+	status string,
+	terminalAt time.Time,
+	claimedUntil sql.NullTime,
+) {
+	t.Helper()
+
+	var processedAt sql.NullTime
+	var failedAt sql.NullTime
+	switch status {
+	case "processed":
+		processedAt = sql.NullTime{Time: terminalAt, Valid: true}
+	case "failed":
+		failedAt = sql.NullTime{Time: terminalAt, Valid: true}
+	}
+
+	_, err := db.Exec(
+		`INSERT INTO telegram_updates (
+			update_id,
+			chat_id,
+			shard_id,
+			payload,
+			status,
+			attempts,
+			claimed_until,
+			next_attempt_at,
+			processed_at,
+			failed_at,
+			last_error
+		) VALUES ($1, $2, 0, '{}', $3, 1, $4, NOW(), $5, $6, 'retention test error')`,
+		updateID,
+		updateID,
+		status,
+		claimedUntil,
+		processedAt,
+		failedAt,
+	)
+	if err != nil {
+		t.Fatalf("insert telegram update %d/%s: %v", updateID, status, err)
+	}
+}
+
 func commandUpdate(chatID int64, command string) tgbotapi.Update {
+	return commandUpdateWithID(0, chatID, command)
+}
+
+func commandUpdateWithID(updateID int, chatID int64, command string) tgbotapi.Update {
 	return tgbotapi.Update{
+		UpdateID: updateID,
 		Message: &tgbotapi.Message{
 			Text: command,
 			Chat: &tgbotapi.Chat{ID: chatID},
@@ -737,6 +1057,35 @@ func commandUpdate(chatID int64, command string) tgbotapi.Update {
 				{Type: "bot_command", Offset: 0, Length: len(command)},
 			},
 		},
+	}
+}
+
+func languageCallbackUpdate(chatID int64, callbackID, data string) tgbotapi.Update {
+	return tgbotapi.Update{
+		CallbackQuery: &tgbotapi.CallbackQuery{
+			ID:   callbackID,
+			Data: data,
+			Message: &tgbotapi.Message{
+				Chat: &tgbotapi.Chat{ID: chatID},
+			},
+		},
+	}
+}
+
+func saveIntegrationTelegramUpdate(t *testing.T, app *App, update tgbotapi.Update) {
+	t.Helper()
+
+	payload, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("marshal telegram update %d: %v", update.UpdateID, err)
+	}
+
+	inserted, err := app.saveTelegramUpdate(context.Background(), update, payload)
+	if err != nil {
+		t.Fatalf("save telegram update %d: %v", update.UpdateID, err)
+	}
+	if !inserted {
+		t.Fatalf("telegram update %d was not inserted", update.UpdateID)
 	}
 }
 
@@ -763,6 +1112,78 @@ func waitForSubscribed(t *testing.T, db *sql.DB, chatID int64, want bool) {
 		case <-tick.C:
 		}
 	}
+}
+
+func waitForTelegramUpdateStatus(t *testing.T, db *sql.DB, updateID int64, wantStatus string) {
+	t.Helper()
+
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		gotStatus, err := selectTelegramUpdateStatus(db, updateID)
+		if err == nil && gotStatus == wantStatus {
+			return
+		}
+
+		select {
+		case <-deadline:
+			if err != nil {
+				t.Fatalf("telegram update %d did not reach status %q: %v", updateID, wantStatus, err)
+			}
+			t.Fatalf("telegram update %d did not reach status %q, last status = %q", updateID, wantStatus, gotStatus)
+		case <-tick.C:
+		}
+	}
+}
+
+func assertTelegramUpdateStatus(t *testing.T, db *sql.DB, updateID int64, wantStatus string) {
+	t.Helper()
+
+	gotStatus, err := selectTelegramUpdateStatus(db, updateID)
+	if err != nil {
+		t.Fatalf("select telegram update %d: %v", updateID, err)
+	}
+	if gotStatus != wantStatus {
+		t.Fatalf("telegram update %d status = %q, want %q", updateID, gotStatus, wantStatus)
+	}
+}
+
+func assertTelegramUpdateAttempts(t *testing.T, db *sql.DB, updateID int64, wantAttempts int) {
+	t.Helper()
+
+	var attempts int
+	if err := db.QueryRow("SELECT attempts FROM telegram_updates WHERE update_id = $1", updateID).Scan(&attempts); err != nil {
+		t.Fatalf("select telegram update attempts %d: %v", updateID, err)
+	}
+	if attempts != wantAttempts {
+		t.Fatalf("telegram update %d attempts = %d, want %d", updateID, attempts, wantAttempts)
+	}
+}
+
+func assertNoTelegramUpdate(t *testing.T, db *sql.DB, updateID int64) {
+	t.Helper()
+
+	assertTelegramUpdateRowCount(t, db, updateID, 0)
+}
+
+func assertTelegramUpdateRowCount(t *testing.T, db *sql.DB, updateID int64, want int) {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM telegram_updates WHERE update_id = $1", updateID).Scan(&count); err != nil {
+		t.Fatalf("count telegram update %d: %v", updateID, err)
+	}
+	if count != want {
+		t.Fatalf("telegram update %d row count = %d, want %d", updateID, count, want)
+	}
+}
+
+func selectTelegramUpdateStatus(db *sql.DB, updateID int64) (string, error) {
+	var status string
+	err := db.QueryRow("SELECT status FROM telegram_updates WHERE update_id = $1", updateID).Scan(&status)
+	return status, err
 }
 
 func assertSubscriberState(t *testing.T, db *sql.DB, chatID int64, wantSubscribed bool, wantInterval int, wantLang string) {
@@ -889,6 +1310,7 @@ func selectLastSent(t *testing.T, db *sql.DB, chatID int64) time.Time {
 type notificationJobState struct {
 	Status        string
 	Attempts      int
+	ClaimToken    sql.NullString
 	ScheduledAt   time.Time
 	NextAttemptAt time.Time
 	ClaimedUntil  sql.NullTime
@@ -926,7 +1348,7 @@ func selectNotificationJobState(t *testing.T, db *sql.DB, chatID int64) (notific
 
 	var job notificationJobState
 	err := db.QueryRow(
-		`SELECT status, attempts, scheduled_at, next_attempt_at, claimed_until, sent_at, failed_at, last_error
+		`SELECT status, attempts, claim_token::text, scheduled_at, next_attempt_at, claimed_until, sent_at, failed_at, last_error
 		 FROM notification_jobs
 		 WHERE chat_id = $1
 		 ORDER BY id DESC
@@ -935,6 +1357,7 @@ func selectNotificationJobState(t *testing.T, db *sql.DB, chatID int64) (notific
 	).Scan(
 		&job.Status,
 		&job.Attempts,
+		&job.ClaimToken,
 		&job.ScheduledAt,
 		&job.NextAttemptAt,
 		&job.ClaimedUntil,

@@ -21,7 +21,7 @@ Hetzner PostgreSQL
 Основні компоненти:
 
 - `Koyeb Web Service` запускає Docker-образ застосунку.
-- `Hetzner PostgreSQL` зберігає підписників, налаштування мов, інтервали сповіщень і кеш цін.
+- `Hetzner PostgreSQL` зберігає підписників, налаштування мов, інтервали сповіщень, кеш цін, webhook inbox і cron outbox.
 - `cron-job.org` викликає `POST /cron` за розкладом.
 - Telegram викликає `POST /webhook`.
 - `/ready` перевіряє доступність PostgreSQL.
@@ -48,7 +48,7 @@ Hetzner PostgreSQL
 - Переконатися, що CI green на GitHub.
 - Перевірити, що `.env.example` не містить реальних секретів.
 - Зробити backup PostgreSQL.
-- Застосувати SQL migration до production DB.
+- Застосувати Goose migrations до production DB.
 - Задеплоїти новий Docker image у Koyeb.
 - Перевірити `/live`, `/ready`, `/metrics`.
 - Перевірити, що cron-job.org отримує `200 OK` від `/cron`.
@@ -59,28 +59,30 @@ Hetzner PostgreSQL
 
 ```text
 1. Backup PostgreSQL
-2. Apply migrations/001_init_schema.sql
+2. Apply Goose migrations
 3. Deploy new Koyeb image
 4. Check /ready
 5. Check /metrics
 6. Check cron execution logs
 ```
 
-Міграцію потрібно застосувати до деплою нового коду, якщо код залежить від нових колонок, індексів або constraints.
+Міграції потрібно застосувати до деплою нового коду, якщо код залежить від нових колонок, індексів або constraints.
 
-## Database Migration
+## Database Migrations
 
 Локально або з безпечного admin host:
 
 ```bash
-psql "$DATABASE_URL" -f migrations/001_init_schema.sql
+go install github.com/pressly/goose/v3/cmd/goose@v3.25.0
+goose -dir migrations postgres "$DATABASE_URL" status
+goose -dir migrations postgres "$DATABASE_URL" up
 ```
 
-На сервері Hetzner можна виконати від імені PostgreSQL admin:
+Якщо production DB раніше вже отримала схему через старий ручний SQL-файл, все одно запускайте `goose up` після backup. Міграції написані з `IF NOT EXISTS` там, де це безпечно, і зафіксують поточний стан у `goose_db_version`. Якщо migration зупиниться через дублікати або неконсистентні дані, не форсуйте версію вручну: спочатку виправте дані або відновіть backup.
 
-```bash
-sudo -u postgres psql -d <database_name> -f /path/to/migrations/001_init_schema.sql
-```
+Якщо міграції запускаються прямо на сервері Hetzner, спочатку склонуйте або оновіть репозиторій із актуальним каталогом `migrations`, потім виконайте ті самі `goose` команди з production `DATABASE_URL`.
+
+Правило для підтримки схеми: вже застосовані migration-файли не редагуються після деплою. Нова зміна схеми додається наступним номером, наприклад `007_some_schema_change.sql`.
 
 Після міграції перевірте ключові таблиці:
 
@@ -88,6 +90,8 @@ sudo -u postgres psql -d <database_name> -f /path/to/migrations/001_init_schema.
 sudo -u postgres psql -d <database_name> -c "\dt"
 sudo -u postgres psql -d <database_name> -c "\d subscribers"
 sudo -u postgres psql -d <database_name> -c "\d market_prices"
+sudo -u postgres psql -d <database_name> -c "\d notification_jobs"
+sudo -u postgres psql -d <database_name> -c "\d telegram_updates"
 ```
 
 ## PostgreSQL Firewall
@@ -205,7 +209,7 @@ curl -fsS https://<service-domain>/ready
 
 ## Integration Tests
 
-PostgreSQL integration tests запускаються окремим CI job і потребують Docker:
+PostgreSQL integration tests запускаються окремим CI job і потребують Docker. Перед integration tests CI також застосовує `goose` migrations до чистого PostgreSQL:
 
 ```bash
 go test -tags=integration ./...
@@ -221,6 +225,12 @@ go test -tags=integration ./...
 - transient Telegram error -> retry later без оновлення `last_sent`;
 - exhausted transient errors -> тимчасовий cooldown через `delivery_suspended_until`.
 - notification outbox retention: `sent` jobs 30 днів, `failed` jobs 90 днів.
+- telegram webhook inbox: update зберігається до `200 OK`, worker переводить його в `processed`.
+- telegram webhook ordering: відкритий earlier update блокує claim пізнішого update того самого chat, а PostgreSQL advisory lock не дає двом replicas одночасно обробляти один chat.
+- language settings: мова читається напряму з PostgreSQL, тому replicas не тримають застаріле локальне значення.
+- notification ownership: outbox worker завершує job тільки з актуальним `claim_token`.
+- stale workers: фіналізація inbox/outbox job дозволена тільки для поточного `attempts`, тому застарілий worker не перезаписує новий claim.
+- telegram inbox retention: `processed` updates 7 днів, `failed` updates 30 днів.
 
 ## Cron
 
@@ -262,7 +272,8 @@ curl -H "Authorization: Bearer $CRON_SECRET" \
 
 - зростання `telegram_send_errors_total`;
 - часті `cron_runs_total{status="conflict"}`;
-- `webhook_updates_total{status="dropped_queue_full"}`;
+- `webhook_updates_total{status="persist_error"}`;
+- backlog у `telegram_updates` зі статусами `pending` або `processing`;
 - `binance_requests_total{status!="success"}`;
 - DB errors у structured logs.
 
@@ -316,6 +327,15 @@ sudo -u postgres psql -d <database_name> -c "SELECT chat_id, interval_minutes, l
 
 ```bash
 sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM notification_jobs GROUP BY status ORDER BY status;"
+sudo -u postgres psql -d <database_name> -c "SELECT chat_id, COUNT(*) FROM notification_jobs WHERE status IN ('pending', 'sending') GROUP BY chat_id HAVING COUNT(*) > 1;"
+```
+
+7. Перевірити webhook inbox:
+
+```bash
+sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM telegram_updates GROUP BY status ORDER BY status;"
+sudo -u postgres psql -d <database_name> -c "SELECT update_id, chat_id, status, attempts, claimed_until, next_attempt_at, last_error FROM telegram_updates WHERE status IN ('pending', 'processing', 'failed') ORDER BY update_id DESC LIMIT 20;"
+sudo -u postgres psql -d <database_name> -c "SELECT chat_id, COUNT(*) FROM telegram_updates WHERE status IN ('pending', 'processing') GROUP BY chat_id HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC LIMIT 20;"
 ```
 
 ### Telegram Webhook Does Not Work
@@ -329,6 +349,11 @@ https://<service-domain>/webhook
 ```
 
 4. Перевірити, що endpoint приймає тільки `POST`.
+5. Перевірити durable inbox:
+
+```bash
+sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM telegram_updates GROUP BY status ORDER BY status;"
+```
 
 ### Binance Prices Are Stale
 
@@ -339,7 +364,7 @@ https://<service-domain>/webhook
 cryptopulse_binance_requests_total
 ```
 
-3. Перевірити DB cache:
+3. Перевірити price cache у DB:
 
 ```bash
 sudo -u postgres psql -d <database_name> -c "SELECT symbol, price, updated_at FROM market_prices ORDER BY symbol;"
@@ -391,7 +416,7 @@ nc -vz <hetzner_server_ip> 5432
 3. Перевірити logs.
 4. Якщо була застосована destructive migration, відновити DB з backup.
 
-Поточна migration `001_init_schema.sql` здебільшого additive/hardening, але backup перед її запуском все одно обов'язковий.
+Поточні migrations здебільшого additive/hardening, але backup перед їх запуском все одно обов'язковий.
 
 ## Production Readiness Notes
 
@@ -401,6 +426,8 @@ nc -vz <hetzner_server_ip> 5432
 - pinned image digests;
 - DB migration;
 - authenticated cron/webhook/metrics;
+- durable webhook inbox і cron outbox;
+- per-chat Telegram update ordering через PostgreSQL claims/advisory locks;
 - JSON structured logs;
 - Prometheus metrics;
 - graceful shutdown;

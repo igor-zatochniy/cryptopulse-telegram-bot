@@ -1,13 +1,12 @@
-BEGIN;
-
+-- +goose Up
+-- +goose StatementBegin
 CREATE TABLE IF NOT EXISTS subscribers (
     chat_id BIGINT,
     interval_minutes INTEGER,
     last_sent TIMESTAMPTZ,
     language_code TEXT,
     is_subscribed BOOLEAN,
-    cron_claimed_until TIMESTAMPTZ,
-    delivery_suspended_until TIMESTAMPTZ
+    cron_claimed_until TIMESTAMPTZ
 );
 
 ALTER TABLE subscribers
@@ -16,8 +15,7 @@ ALTER TABLE subscribers
     ADD COLUMN IF NOT EXISTS last_sent TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS language_code TEXT,
     ADD COLUMN IF NOT EXISTS is_subscribed BOOLEAN,
-    ADD COLUMN IF NOT EXISTS cron_claimed_until TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS delivery_suspended_until TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS cron_claimed_until TIMESTAMPTZ;
 
 UPDATE subscribers
 SET
@@ -87,12 +85,8 @@ ON subscribers (chat_id);
 
 CREATE INDEX IF NOT EXISTS idx_subscribers_cron_due
 ON subscribers (last_sent ASC NULLS FIRST, cron_claimed_until)
-INCLUDE (chat_id, language_code, interval_minutes, delivery_suspended_until)
+INCLUDE (chat_id, language_code, interval_minutes)
 WHERE is_subscribed = TRUE;
-
-CREATE INDEX IF NOT EXISTS idx_subscribers_delivery_suspended_until
-ON subscribers (delivery_suspended_until)
-WHERE is_subscribed = TRUE AND delivery_suspended_until IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS market_prices (
     symbol TEXT,
@@ -149,41 +143,13 @@ END $$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS market_prices_symbol_uidx
 ON market_prices (symbol);
+-- +goose StatementEnd
 
-CREATE TABLE IF NOT EXISTS notification_jobs (
-    id BIGSERIAL PRIMARY KEY,
-    chat_id BIGINT NOT NULL,
-    language_code TEXT NOT NULL DEFAULT 'ua',
-    message_text TEXT NOT NULL,
-    scheduled_at TIMESTAMPTZ NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempts INTEGER NOT NULL DEFAULT 0,
-    claimed_until TIMESTAMPTZ,
-    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    sent_at TIMESTAMPTZ,
-    failed_at TIMESTAMPTZ,
-    last_error TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT notification_jobs_status_check
-        CHECK (status IN ('pending', 'sending', 'sent', 'failed')),
-    CONSTRAINT notification_jobs_attempts_check
-        CHECK (attempts >= 0)
-);
-
-CREATE INDEX IF NOT EXISTS idx_notification_jobs_pending
-ON notification_jobs (next_attempt_at, claimed_until, scheduled_at, id)
-WHERE status IN ('pending', 'sending');
-
-CREATE INDEX IF NOT EXISTS idx_notification_jobs_chat_status
-ON notification_jobs (chat_id, status);
-
-CREATE INDEX IF NOT EXISTS idx_notification_jobs_sent_retention
-ON notification_jobs (sent_at)
-WHERE status = 'sent' AND sent_at IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_notification_jobs_failed_retention
-ON notification_jobs (failed_at)
-WHERE status = 'failed' AND failed_at IS NOT NULL;
-
-COMMIT;
+-- +goose Down
+-- +goose StatementBegin
+DROP INDEX IF EXISTS market_prices_symbol_uidx;
+DROP TABLE IF EXISTS market_prices;
+DROP INDEX IF EXISTS idx_subscribers_cron_due;
+DROP INDEX IF EXISTS subscribers_chat_id_uidx;
+DROP TABLE IF EXISTS subscribers;
+-- +goose StatementEnd
