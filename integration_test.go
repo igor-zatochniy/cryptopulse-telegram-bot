@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -145,25 +146,7 @@ func setupIntegrationDB(t *testing.T) *sql.DB {
 	defer cancel()
 
 	if connString := os.Getenv("INTEGRATION_DATABASE_URL"); connString != "" {
-		db, err := sql.Open("pgx", connString)
-		if err != nil {
-			t.Fatalf("open integration postgres: %v", err)
-		}
-		t.Cleanup(func() {
-			if err := db.Close(); err != nil {
-				t.Logf("close integration postgres db: %v", err)
-			}
-		})
-
-		db.SetMaxOpenConns(5)
-		db.SetMaxIdleConns(5)
-
-		if err := db.PingContext(ctx); err != nil {
-			t.Fatalf("ping integration postgres: %v", err)
-		}
-
-		applyIntegrationMigrations(t, ctx, db, true)
-		return db
+		return setupSharedPostgresIntegrationDB(t, ctx, connString)
 	}
 
 	container, err := postgres.Run(
@@ -207,20 +190,89 @@ func setupIntegrationDB(t *testing.T) *sql.DB {
 		t.Fatalf("ping postgres: %v", err)
 	}
 
-	applyIntegrationMigrations(t, ctx, db, false)
+	applyIntegrationMigrations(t, ctx, db)
 	return db
 }
 
-func applyIntegrationMigrations(t *testing.T, ctx context.Context, db *sql.DB, reset bool) {
+func setupSharedPostgresIntegrationDB(t *testing.T, ctx context.Context, connString string) *sql.DB {
+	t.Helper()
+
+	dbName := fmt.Sprintf("cryptopulse_test_%d", time.Now().UnixNano())
+	adminConnString := postgresConnStringForDB(t, connString, "postgres")
+
+	adminDB, err := sql.Open("pgx", adminConnString)
+	if err != nil {
+		t.Fatalf("open integration postgres admin db: %v", err)
+	}
+
+	if err := adminDB.PingContext(ctx); err != nil {
+		adminDB.Close()
+		t.Fatalf("ping integration postgres admin db: %v", err)
+	}
+
+	if _, err := adminDB.ExecContext(ctx, "CREATE DATABASE "+quotePostgresIdentifier(dbName)); err != nil {
+		adminDB.Close()
+		t.Fatalf("create isolated integration postgres db: %v", err)
+	}
+
+	db, err := sql.Open("pgx", postgresConnStringForDB(t, connString, dbName))
+	if err != nil {
+		adminDB.Close()
+		t.Fatalf("open isolated integration postgres db: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Logf("close integration postgres db: %v", err)
+		}
+
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+
+		if _, err := adminDB.ExecContext(cleanupCtx, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", dbName); err != nil {
+			t.Logf("terminate integration postgres connections: %v", err)
+		}
+		if _, err := adminDB.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS "+quotePostgresIdentifier(dbName)); err != nil {
+			t.Logf("drop integration postgres db: %v", err)
+		}
+		if err := adminDB.Close(); err != nil {
+			t.Logf("close integration postgres admin db: %v", err)
+		}
+	})
+
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(5)
+
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("ping isolated integration postgres db: %v", err)
+	}
+
+	applyIntegrationMigrations(t, ctx, db)
+	return db
+}
+
+func postgresConnStringForDB(t *testing.T, connString, dbName string) string {
+	t.Helper()
+
+	parsed, err := url.Parse(connString)
+	if err != nil {
+		t.Fatalf("parse integration postgres URL: %v", err)
+	}
+
+	parsed.Path = "/" + dbName
+	parsed.RawPath = ""
+	return parsed.String()
+}
+
+func quotePostgresIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+}
+
+func applyIntegrationMigrations(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
 
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("set goose dialect: %v", err)
-	}
-	if reset {
-		if err := goose.ResetContext(ctx, db, "migrations"); err != nil {
-			t.Fatalf("reset migrations: %v", err)
-		}
 	}
 	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
 		t.Fatalf("apply migrations: %v", err)
