@@ -659,7 +659,9 @@ func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
 		t.Fatalf("cron status = %d, body = %q", rec.Code, rec.Body.String())
 	}
 	received301 := waitForNotificationJobStatus(t, db, 301, "sent")
-	pending302 := waitForNotificationJobStatus(t, db, 302, "pending")
+	pending302 := waitForNotificationJob(t, db, 302, func(job notificationJobState) bool {
+		return job.Status == "pending" && job.Attempts == 1
+	})
 	failed303 := waitForNotificationJobStatus(t, db, 303, "failed")
 
 	if received301.Attempts != 1 {
@@ -738,7 +740,7 @@ func TestIntegrationCronReturnsBeforeTelegramDeliveryCompletes(t *testing.T) {
 
 	select {
 	case <-sendStarted:
-	case <-time.After(1 * time.Second):
+	case <-time.After(notificationJobPollInterval + 2*time.Second):
 		t.Fatal("telegram delivery did not start")
 	}
 
@@ -1406,22 +1408,30 @@ type notificationJobState struct {
 func waitForNotificationJobStatus(t *testing.T, db *sql.DB, chatID int64, wantStatus string) notificationJobState {
 	t.Helper()
 
+	return waitForNotificationJob(t, db, chatID, func(job notificationJobState) bool {
+		return job.Status == wantStatus
+	})
+}
+
+func waitForNotificationJob(t *testing.T, db *sql.DB, chatID int64, matches func(notificationJobState) bool) notificationJobState {
+	t.Helper()
+
 	deadline := time.After(10 * time.Second)
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
 
 	for {
 		job, err := selectNotificationJobState(t, db, chatID)
-		if err == nil && job.Status == wantStatus {
+		if err == nil && matches(job) {
 			return job
 		}
 
 		select {
 		case <-deadline:
 			if err != nil {
-				t.Fatalf("notification job %d did not reach status %q: %v", chatID, wantStatus, err)
+				t.Fatalf("notification job %d did not reach expected state: %v", chatID, err)
 			}
-			t.Fatalf("notification job %d did not reach status %q, last status = %q", chatID, wantStatus, job.Status)
+			t.Fatalf("notification job %d did not reach expected state, last state = %+v", chatID, job)
 		case <-tick.C:
 		}
 	}
