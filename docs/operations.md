@@ -209,7 +209,7 @@ curl -fsS https://<service-domain>/ready
 
 ## Integration Tests
 
-PostgreSQL integration tests запускаються окремим CI job і потребують Docker. Перед integration tests CI також застосовує `goose` migrations до чистого PostgreSQL:
+PostgreSQL integration tests запускаються окремим CI job. У CI вони використовують PostgreSQL service через `INTEGRATION_DATABASE_URL`; локально без цієї змінної вони використовують `testcontainers-go` і потребують Docker. Перед integration tests CI також застосовує `goose` migrations до чистого PostgreSQL:
 
 ```bash
 go test -tags=integration ./...

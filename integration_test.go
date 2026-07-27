@@ -144,6 +144,28 @@ func setupIntegrationDB(t *testing.T) *sql.DB {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	if connString := os.Getenv("INTEGRATION_DATABASE_URL"); connString != "" {
+		db, err := sql.Open("pgx", connString)
+		if err != nil {
+			t.Fatalf("open integration postgres: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Logf("close integration postgres db: %v", err)
+			}
+		})
+
+		db.SetMaxOpenConns(5)
+		db.SetMaxIdleConns(5)
+
+		if err := db.PingContext(ctx); err != nil {
+			t.Fatalf("ping integration postgres: %v", err)
+		}
+
+		applyIntegrationMigrations(t, ctx, db, true)
+		return db
+	}
+
 	container, err := postgres.Run(
 		ctx,
 		"postgres:16-alpine",
@@ -185,14 +207,24 @@ func setupIntegrationDB(t *testing.T) *sql.DB {
 		t.Fatalf("ping postgres: %v", err)
 	}
 
+	applyIntegrationMigrations(t, ctx, db, false)
+	return db
+}
+
+func applyIntegrationMigrations(t *testing.T, ctx context.Context, db *sql.DB, reset bool) {
+	t.Helper()
+
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("set goose dialect: %v", err)
+	}
+	if reset {
+		if err := goose.ResetContext(ctx, db, "migrations"); err != nil {
+			t.Fatalf("reset migrations: %v", err)
+		}
 	}
 	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-
-	return db
 }
 
 func skipOrFailUnavailableTestcontainer(t *testing.T, err error) {

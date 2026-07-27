@@ -210,7 +210,7 @@ GitHub Actions запускається на кожен push і pull request:
 
 Поточний CI status показаний badge у верхній частині README.
 
-Integration tests використовують `testcontainers-go`, піднімають PostgreSQL container і потребують доступного Docker daemon.
+Integration tests у CI використовують PostgreSQL service через `INTEGRATION_DATABASE_URL`. Локально, якщо ця змінна не задана, тести використовують `testcontainers-go` і потребують доступного Docker daemon.
 
 ## Операції
 

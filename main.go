@@ -1821,23 +1821,6 @@ func isPermanentTelegramSendError(err error) bool {
 		strings.Contains(msg, "bot can't initiate conversation")
 }
 
-func (a *App) markSubscriberUnsubscribed(chatID int64) {
-	dbCtx, dbCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer dbCancel()
-
-	if _, err := a.db.ExecContext(
-		dbCtx,
-		"UPDATE subscribers SET is_subscribed = FALSE, cron_claimed_until = NULL, delivery_suspended_until = NULL WHERE chat_id = $1",
-		chatID,
-	); err != nil {
-		dbOperationsTotal.WithLabelValues("mark_unsubscribed", "error").Inc()
-		slog.Error("failed to mark subscriber as unsubscribed", "chat_id", chatID, "error", err)
-		return
-	}
-
-	dbOperationsTotal.WithLabelValues("mark_unsubscribed", "success").Inc()
-}
-
 func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	var providedToken string

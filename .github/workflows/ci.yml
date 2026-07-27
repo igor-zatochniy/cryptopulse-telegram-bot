@@ -105,6 +105,8 @@ jobs:
           go run github.com/pressly/goose/v3/cmd/goose@v3.25.0 -dir migrations postgres "$DATABASE_URL" status
 
       - name: Run PostgreSQL integration tests
+        env:
+          INTEGRATION_DATABASE_URL: postgres://cryptopulse_user:integration_password@127.0.0.1:5432/cryptopulse?sslmode=disable
         run: go test -tags=integration ./...
 
   docker:
