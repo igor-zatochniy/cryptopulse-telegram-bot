@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package app
 
 import (
 	"bytes"
@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,9 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	apptelegram "github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/telegram"
+	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/workers"
 )
 
 const (
@@ -274,7 +278,7 @@ func applyIntegrationMigrations(t *testing.T, ctx context.Context, db *sql.DB) {
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("set goose dialect: %v", err)
 	}
-	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
+	if err := goose.UpContext(ctx, db, filepath.Join("..", "..", "migrations")); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
 }
@@ -300,6 +304,7 @@ func newIntegrationApp(t *testing.T, db *sql.DB, bot *tgbotapi.BotAPI) *App {
 		httpClient:    http.DefaultClient,
 		webhookSecret: "webhook-secret",
 		cronSecret:    "cron-secret",
+		metricsSecret: "metrics-secret",
 	}
 
 	for _, coin := range trackedCoins {
@@ -473,7 +478,7 @@ func TestIntegrationTelegramUpdateWorkerProcessesDurableInbox(t *testing.T) {
 	runCtx, cancel := context.WithCancel(context.Background())
 	var workerWG sync.WaitGroup
 	workerWG.Add(1)
-	go app.updateWorker(runCtx, &workerWG, telegramShardIndex(chatID, telegramUpdateWorkerCount))
+	go app.updateWorker(runCtx, &workerWG, telegramShardIndex(chatID, workers.TelegramUpdateWorkerCount))
 	t.Cleanup(func() {
 		cancel()
 		workerWG.Wait()
@@ -496,7 +501,7 @@ func TestIntegrationTelegramInboxClaimsPreserveSameChatOrderAcrossReplicas(t *te
 	saveIntegrationTelegramUpdate(t, appA, commandUpdateWithID(int(firstUpdateID), chatID, "/subscribe"))
 	saveIntegrationTelegramUpdate(t, appA, commandUpdateWithID(int(secondUpdateID), chatID, "/unsubscribe"))
 
-	shardID := telegramShardIndex(chatID, telegramUpdateWorkerCount)
+	shardID := telegramShardIndex(chatID, workers.TelegramUpdateWorkerCount)
 	firstJob, err := appA.claimPendingTelegramUpdate(context.Background(), shardID)
 	if err != nil {
 		t.Fatalf("claim first telegram update: %v", err)
@@ -518,7 +523,7 @@ func TestIntegrationTelegramInboxClaimsPreserveSameChatOrderAcrossReplicas(t *te
 		t.Fatalf("second replica claimed update %d while earlier update %d is still processing", secondJob.UpdateID, firstUpdateID)
 	}
 
-	if err := appA.markTelegramUpdateProcessed(*firstJob); err != nil {
+	if err := appA.markTelegramUpdateProcessed(context.Background(), *firstJob); err != nil {
 		t.Fatalf("mark first telegram update processed: %v", err)
 	}
 
@@ -552,7 +557,7 @@ func TestIntegrationTelegramChatAdvisoryLockBlocksSameChatAcrossReplicas(t *test
 	lockHeld := true
 	t.Cleanup(func() {
 		if lockHeld {
-			releaseTelegramChatAdvisoryLock(lockConn, lockKey)
+			releaseTelegramChatAdvisoryLock(context.Background(), lockConn, lockKey)
 		}
 	})
 
@@ -560,11 +565,11 @@ func TestIntegrationTelegramChatAdvisoryLockBlocksSameChatAcrossReplicas(t *test
 	blockedConn, blockedKey, err := appB.acquireTelegramChatAdvisoryLock(blockedCtx, chatID)
 	blockedCancel()
 	if err == nil {
-		releaseTelegramChatAdvisoryLock(blockedConn, blockedKey)
+		releaseTelegramChatAdvisoryLock(context.Background(), blockedConn, blockedKey)
 		t.Fatal("second replica acquired the same chat advisory lock while first replica still held it")
 	}
 
-	releaseTelegramChatAdvisoryLock(lockConn, lockKey)
+	releaseTelegramChatAdvisoryLock(context.Background(), lockConn, lockKey)
 	lockHeld = false
 
 	freeCtx, freeCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -573,7 +578,7 @@ func TestIntegrationTelegramChatAdvisoryLockBlocksSameChatAcrossReplicas(t *test
 	if err != nil {
 		t.Fatalf("acquire chat advisory lock after release: %v", err)
 	}
-	releaseTelegramChatAdvisoryLock(nextConn, nextKey)
+	releaseTelegramChatAdvisoryLock(context.Background(), nextConn, nextKey)
 }
 
 func TestIntegrationStaleTelegramUpdateClaimCannotMarkProcessed(t *testing.T) {
@@ -586,7 +591,10 @@ func TestIntegrationStaleTelegramUpdateClaimCannotMarkProcessed(t *testing.T) {
 
 	saveIntegrationTelegramUpdate(t, app, commandUpdateWithID(int(updateID), chatID, "/subscribe"))
 
-	job, err := app.claimPendingTelegramUpdate(context.Background(), telegramShardIndex(chatID, telegramUpdateWorkerCount))
+	job, err := app.claimPendingTelegramUpdate(
+		context.Background(),
+		telegramShardIndex(chatID, workers.TelegramUpdateWorkerCount),
+	)
 	if err != nil {
 		t.Fatalf("claim telegram update: %v", err)
 	}
@@ -605,7 +613,7 @@ func TestIntegrationStaleTelegramUpdateClaimCannotMarkProcessed(t *testing.T) {
 		t.Fatalf("simulate newer telegram update claim: %v", err)
 	}
 
-	err = app.markTelegramUpdateProcessed(*job)
+	err = app.markTelegramUpdateProcessed(context.Background(), *job)
 	if !errors.Is(err, errJobOwnershipLost) {
 		t.Fatalf("mark stale telegram update processed error = %v, want %v", err, errJobOwnershipLost)
 	}
@@ -740,7 +748,7 @@ func TestIntegrationCronReturnsBeforeTelegramDeliveryCompletes(t *testing.T) {
 
 	select {
 	case <-sendStarted:
-	case <-time.After(notificationJobPollInterval + 2*time.Second):
+	case <-time.After(workers.NotificationJobPollInterval + 2*time.Second):
 		t.Fatal("telegram delivery did not start")
 	}
 
@@ -829,7 +837,7 @@ func TestIntegrationStaleNotificationClaimCannotMarkSent(t *testing.T) {
 		t.Fatalf("simulate newer notification claim: %v", err)
 	}
 
-	err = app.markNotificationJobSent(*job)
+	err = app.markNotificationJobSent(context.Background(), *job)
 	if !errors.Is(err, errJobOwnershipLost) {
 		t.Fatalf("mark stale notification job sent error = %v, want %v", err, errJobOwnershipLost)
 	}
@@ -868,7 +876,7 @@ func TestIntegrationExhaustedTransientFailureSuspendsSubscriber(t *testing.T) {
 		t.Fatalf("created jobs = %d, want 1", created)
 	}
 
-	for attempt := 1; attempt <= notificationJobMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= workers.NotificationJobMaxAttempts; attempt++ {
 		job, err := app.claimPendingNotificationJob(context.Background())
 		if err != nil {
 			t.Fatalf("claim notification job attempt %d: %v", attempt, err)
@@ -877,9 +885,9 @@ func TestIntegrationExhaustedTransientFailureSuspendsSubscriber(t *testing.T) {
 			t.Fatalf("claim notification job attempt %d returned nil", attempt)
 		}
 
-		app.processNotificationJob(*job)
+		app.processNotificationJob(context.Background(), *job)
 
-		if attempt < notificationJobMaxAttempts {
+		if attempt < workers.NotificationJobMaxAttempts {
 			if _, err := db.Exec(
 				"UPDATE notification_jobs SET next_attempt_at = NOW() - INTERVAL '1 second' WHERE id = $1",
 				job.ID,
@@ -890,8 +898,8 @@ func TestIntegrationExhaustedTransientFailureSuspendsSubscriber(t *testing.T) {
 	}
 
 	failedJob := waitForNotificationJobStatus(t, db, chatID, "failed")
-	if failedJob.Attempts != notificationJobMaxAttempts {
-		t.Fatalf("failed job attempts = %d, want %d", failedJob.Attempts, notificationJobMaxAttempts)
+	if failedJob.Attempts != workers.NotificationJobMaxAttempts {
+		t.Fatalf("failed job attempts = %d, want %d", failedJob.Attempts, workers.NotificationJobMaxAttempts)
 	}
 
 	assertLastSentUnchanged(t, db, chatID, oldLastSent)
@@ -1002,14 +1010,22 @@ func TestIntegrationCronUsesPostgresAdvisoryLock(t *testing.T) {
 	t.Cleanup(func() {
 		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer unlockCancel()
-		_, _ = lockConn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock($1)`, cronAdvisoryLockKey)
+		_, _ = lockConn.ExecContext(
+			unlockCtx,
+			`SELECT pg_advisory_unlock($1)`,
+			workers.CronAdvisoryLockKey,
+		)
 		_ = lockConn.Close()
 	})
 
 	lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer lockCancel()
 	var acquired bool
-	if err := lockConn.QueryRowContext(lockCtx, `SELECT pg_try_advisory_lock($1)`, cronAdvisoryLockKey).Scan(&acquired); err != nil {
+	if err := lockConn.QueryRowContext(
+		lockCtx,
+		`SELECT pg_try_advisory_lock($1)`,
+		workers.CronAdvisoryLockKey,
+	).Scan(&acquired); err != nil {
 		t.Fatalf("acquire advisory lock: %v", err)
 	}
 	if !acquired {
@@ -1485,7 +1501,7 @@ func TestIntegrationPermanentTelegramErrorClassifier(t *testing.T) {
 		Code:    http.StatusForbidden,
 		Message: "Forbidden: bot was blocked by the user",
 	}
-	if !isPermanentTelegramSendError(err) {
+	if !apptelegram.IsPermanentSendError(err) {
 		t.Fatal("forbidden Telegram error was not classified as permanent")
 	}
 
@@ -1493,7 +1509,7 @@ func TestIntegrationPermanentTelegramErrorClassifier(t *testing.T) {
 		Code:    http.StatusTooManyRequests,
 		Message: "Too Many Requests: retry later",
 	}
-	if isPermanentTelegramSendError(transientErr) {
+	if apptelegram.IsPermanentSendError(transientErr) {
 		t.Fatal("429 Telegram error was classified as permanent")
 	}
 }

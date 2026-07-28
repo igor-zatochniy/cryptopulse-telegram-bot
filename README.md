@@ -88,11 +88,17 @@ flowchart LR
 ```text
 .
 ├── .github/workflows/ci.yml      # CI: tests, vet, race, lint, govulncheck, Docker build, gitleaks
+├── cmd/cryptopulse/main.go       # Тонка точка входу процесу
 ├── docs/operations.md            # Production runbook для деплою, DB, firewall і incident response
-├── migrations/*.sql               # Versioned Goose migrations для PostgreSQL
+├── internal/app/                 # Бізнес-сценарії та lifecycle orchestration
+├── internal/config/              # Завантаження й перевірка environment variables
+├── internal/httpserver/          # HTTP server, middleware та rate limiting
+├── internal/metrics/             # Prometheus collectors
+├── internal/storage/             # PostgreSQL connection pool
+├── internal/telegram/            # Локалізація, клавіатури та Telegram error policy
+├── internal/workers/             # Retry, lease і retention policy
+├── migrations/*.sql             # Versioned Goose migrations для PostgreSQL
 ├── Dockerfile                    # Multi-stage production image
-├── main.go                       # Точка входу застосунку та сервісна логіка
-├── main_test.go                  # Regression tests для middleware/auth behavior
 ├── .golangci.yml                 # Конфігурація golangci-lint v2
 ├── .env.example                  # Безпечний шаблон environment variables
 ├── LICENSE                       # MIT license
@@ -110,7 +116,7 @@ flowchart LR
 | `/ready` | `GET` | none | Readiness check. Перевіряє підключення до PostgreSQL. |
 | `/webhook` | `POST` | `X-Telegram-Bot-Api-Secret-Token` | Зберігає Telegram update у durable inbox перед `200 OK`. |
 | `/cron` | `POST` | `Authorization: Bearer <CRON_SECRET>` | Забирає due subscribers і надсилає заплановані сповіщення. |
-| `/metrics` | `GET` | `Authorization: Bearer <CRON_SECRET>` | Prometheus metrics. |
+| `/metrics` | `GET` | `Authorization: Bearer <METRICS_SECRET>` | Prometheus metrics. |
 
 ## Змінні Середовища
 
@@ -127,7 +133,8 @@ cp .env.example .env
 | `DATABASE_URL` | yes | PostgreSQL connection string. У production використовуйте `sslmode=require`. |
 | `TELEGRAM_APITOKEN` | yes | Telegram bot token від BotFather. |
 | `WEBHOOK_SECRET_TOKEN` | yes | Secret, який очікується від Telegram webhook requests. |
-| `CRON_SECRET` | yes | Bearer secret для `/cron` і `/metrics`. |
+| `CRON_SECRET` | yes | Bearer secret для `/cron`. |
+| `METRICS_SECRET` | no | Окремий Bearer secret для `/metrics`; без нього використовується `CRON_SECRET`. |
 | `PORT` | no | HTTP port. За замовчуванням `8080`. |
 
 Ніколи не комітьте реальні `.env` файли або production secrets.
@@ -167,7 +174,7 @@ goose -dir migrations postgres "$DATABASE_URL" up
 ```bash
 go mod download
 go test ./...
-go run .
+go run ./cmd/cryptopulse
 ```
 
 Під час локальної розробки застосунок автоматично завантажує `.env`.
@@ -233,7 +240,7 @@ curl -X POST \
 Приклад metrics request:
 
 ```bash
-curl -H "Authorization: Bearer $CRON_SECRET" \
+curl -H "Authorization: Bearer $METRICS_SECRET" \
   https://<service-domain>/metrics
 ```
 

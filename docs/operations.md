@@ -255,7 +255,7 @@ curl -X POST \
 Metrics endpoint потребує Bearer token:
 
 ```bash
-curl -H "Authorization: Bearer $CRON_SECRET" \
+curl -H "Authorization: Bearer $METRICS_SECRET" \
   https://<service-domain>/metrics
 ```
 
@@ -397,6 +397,7 @@ nc -vz <hetzner_server_ip> 5432
 - `TELEGRAM_APITOKEN`
 - `WEBHOOK_SECRET_TOKEN`
 - `CRON_SECRET`
+- `METRICS_SECRET`
 - PostgreSQL password у `DATABASE_URL`
 
 Після rotation:
@@ -437,6 +438,5 @@ nc -vz <hetzner_server_ip> 5432
 
 Наступні покращення для більшого масштабу:
 
-- окремий `METRICS_SECRET`;
 - static egress/private networking для Koyeb-to-PostgreSQL;
 - automated backup schedule.
