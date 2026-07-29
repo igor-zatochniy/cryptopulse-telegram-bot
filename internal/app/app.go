@@ -2,6 +2,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"log/slog"
@@ -21,8 +22,9 @@ type Subscriber struct {
 }
 
 type PriceEntry struct {
-	Current  float64
-	Previous float64
+	Current   float64
+	Previous  float64
+	UpdatedAt time.Time
 }
 
 type PriceCache struct {
@@ -38,18 +40,31 @@ func (c *PriceCache) Load(symbol string) (PriceEntry, bool) {
 }
 
 func (c *PriceCache) Store(symbol string, newPrice float64) {
+	c.StoreAt(symbol, newPrice, time.Now().UTC())
+}
+
+func (c *PriceCache) StoreAt(symbol string, newPrice float64, updatedAt time.Time) {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	oldEntry, ok := c.store[symbol]
 	if !ok {
-		c.store[symbol] = PriceEntry{Current: newPrice, Previous: newPrice}
+		c.store[symbol] = PriceEntry{
+			Current:   newPrice,
+			Previous:  newPrice,
+			UpdatedAt: updatedAt,
+		}
 		return
 	}
 
 	c.store[symbol] = PriceEntry{
-		Current:  newPrice,
-		Previous: oldEntry.Current,
+		Current:   newPrice,
+		Previous:  oldEntry.Current,
+		UpdatedAt: updatedAt,
 	}
 }
 
@@ -101,7 +116,22 @@ var errJobOwnershipLost = errors.New("job ownership lost")
 
 // --- БЕЗПЕЧНІ ОБГОРТКИ ДЛЯ TELEGRAM ---
 
-func (a *App) sendSafeMessage(chatID int64, text string, markup interface{}) {
+func (a *App) sendSafeMessage(ctx context.Context, chatID int64, text string, markup interface{}) {
+	if collector := telegramReplyCollectorFromContext(ctx); collector != nil {
+		encodedMarkup, err := encodeTelegramReplyMarkup(markup)
+		if err != nil {
+			collector.setError(err)
+			return
+		}
+		collector.add(TelegramReply{
+			Operation:   telegramReplySendMessage,
+			ChatID:      chatID,
+			Text:        text,
+			ReplyMarkup: encodedMarkup,
+		})
+		return
+	}
+
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
 	if markup != nil {
@@ -114,11 +144,28 @@ func (a *App) sendSafeMessage(chatID int64, text string, markup interface{}) {
 }
 
 func (a *App) editSafeMessage(
+	ctx context.Context,
 	chatID int64,
 	messageID int,
 	text string,
 	markup *tgbotapi.InlineKeyboardMarkup,
 ) {
+	if collector := telegramReplyCollectorFromContext(ctx); collector != nil {
+		encodedMarkup, err := encodeTelegramReplyMarkup(markup)
+		if err != nil {
+			collector.setError(err)
+			return
+		}
+		collector.add(TelegramReply{
+			Operation:   telegramReplyEditMessage,
+			ChatID:      chatID,
+			MessageID:   messageID,
+			Text:        text,
+			ReplyMarkup: encodedMarkup,
+		})
+		return
+	}
+
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	edit.ParseMode = "Markdown"
 	if markup != nil {

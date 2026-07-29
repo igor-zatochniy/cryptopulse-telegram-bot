@@ -8,24 +8,32 @@ import (
 
 const (
 	CronBatchLimit                   = 100
-	TelegramUpdateWorkerCount        = 20
+	TelegramUpdateShardCount         = 64
+	DefaultTelegramUpdateWorkerCount = 10
 	TelegramUpdatePollInterval       = 2 * time.Second
 	TelegramUpdateClaimWindow        = 45 * time.Second
 	TelegramUpdateMaxAttempts        = 3
 	TelegramUpdateProcessedRetention = 7 * 24 * time.Hour
 	TelegramUpdateFailedRetention    = 30 * 24 * time.Hour
+	TelegramReplyWorkerCount         = 5
+	TelegramReplyPollInterval        = 2 * time.Second
+	TelegramReplyClaimWindow         = 45 * time.Second
+	TelegramReplyMaxAttempts         = 3
+	TelegramReplySentRetention       = 7 * 24 * time.Hour
+	TelegramReplyFailedRetention     = 30 * 24 * time.Hour
 
 	// NotificationJobClaimWindow покриває 10s Telegram timeout і збереження результату в БД.
-	NotificationJobClaimWindow        = 45 * time.Second
-	NotificationJobPollInterval       = 2 * time.Second
-	NotificationJobMaxAttempts        = 3
-	NotificationFailureCooldown       = 15 * time.Minute
-	RetentionCleanupInterval          = time.Hour
-	NotificationSentRetention         = 30 * 24 * time.Hour
-	NotificationFailedRetention       = 90 * 24 * time.Hour
-	RetentionCleanupLimit             = 1000
-	CronAdvisoryLockKey         int64 = 0x63726f6e6c6f636b
-	TelegramChatLockPrefix            = "cryptopulse:telegram-chat:"
+	NotificationJobClaimWindow          = 45 * time.Second
+	NotificationJobPollInterval         = 2 * time.Second
+	NotificationJobMaxAttempts          = 3
+	NotificationFailureCooldown         = 15 * time.Minute
+	RetentionCleanupInterval            = time.Hour
+	NotificationSentRetention           = 30 * 24 * time.Hour
+	NotificationFailedRetention         = 90 * 24 * time.Hour
+	NotificationCanceledRetention       = 30 * 24 * time.Hour
+	RetentionCleanupLimit               = 1000
+	CronAdvisoryLockKey           int64 = 0x63726f6e6c6f636b
+	TelegramChatLockPrefix              = "cryptopulse:telegram-chat:"
 )
 
 // PostgresInterval перетворює duration на безпечний interval-параметр PostgreSQL.

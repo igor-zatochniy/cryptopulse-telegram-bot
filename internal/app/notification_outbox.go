@@ -243,6 +243,32 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 		return
 	}
 
+	lockCtx, lockCancel := context.WithTimeout(ctx, 10*time.Second)
+	lockConn, lockKey, err := a.acquireTelegramChatAdvisoryLock(lockCtx, job.ChatID)
+	lockCancel()
+	if err != nil {
+		a.deferNotificationJob(ctx, job, fmt.Errorf("acquire telegram chat lock: %w", err))
+		return
+	}
+	defer releaseTelegramChatAdvisoryLock(ctx, lockConn, lockKey)
+
+	subscribed, err := a.isSubscribed(ctx, job.ChatID)
+	if err != nil {
+		a.deferNotificationJob(ctx, job, fmt.Errorf("check subscription before delivery: %w", err))
+		return
+	}
+	if !subscribed {
+		if err := a.markNotificationJobCanceled(ctx, job); err != nil {
+			if errors.Is(err, errJobOwnershipLost) {
+				slog.Info("notification job was canceled before delivery", "job_id", job.ID)
+			} else {
+				slog.Error("failed to persist canceled notification job", "job_id", job.ID, "error", err)
+			}
+		}
+		appmetrics.CronDeliveriesTotal.WithLabelValues("canceled").Inc()
+		return
+	}
+
 	msg := tgbotapi.NewMessage(job.ChatID, job.Text)
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = apptelegram.RefreshKeyboard(job.Lang)
@@ -297,6 +323,29 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 	}
 
 	appmetrics.CronDeliveriesTotal.WithLabelValues("sent").Inc()
+}
+
+func (a *App) deferNotificationJob(ctx context.Context, job NotificationJob, processingErr error) {
+	if job.Attempts >= workers.NotificationJobMaxAttempts {
+		if err := a.markNotificationJobFailed(ctx, job, processingErr, false); err != nil {
+			if errors.Is(err, errJobOwnershipLost) {
+				slog.Warn("ignored stale notification failure result", "job_id", job.ID, "attempts", job.Attempts)
+			} else {
+				slog.Error("failed to persist notification failure", "job_id", job.ID, "error", err)
+			}
+		}
+		appmetrics.CronDeliveriesTotal.WithLabelValues("failed_exhausted").Inc()
+		return
+	}
+
+	if err := a.markNotificationJobRetry(ctx, job, processingErr); err != nil {
+		if errors.Is(err, errJobOwnershipLost) {
+			slog.Warn("ignored stale notification retry result", "job_id", job.ID, "attempts", job.Attempts)
+		} else {
+			slog.Error("failed to persist notification retry", "job_id", job.ID, "error", err)
+		}
+	}
+	appmetrics.CronDeliveriesTotal.WithLabelValues("retry").Inc()
 }
 
 func (a *App) markNotificationJobSent(ctx context.Context, job NotificationJob) error {
@@ -420,6 +469,64 @@ func (a *App) markNotificationJobRetry(ctx context.Context, job NotificationJob,
 	}
 
 	appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_retry", "success").Inc()
+	return nil
+}
+
+func (a *App) markNotificationJobCanceled(ctx context.Context, job NotificationJob) error {
+	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
+	defer dbCancel()
+
+	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_canceled", "error").Inc()
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	result, err := tx.ExecContext(
+		dbCtx,
+		`UPDATE notification_jobs
+		 SET status = 'canceled',
+		     canceled_at = NOW(),
+		     claim_token = NULL,
+		     claimed_until = NULL,
+		     last_error = 'subscriber is not active',
+		     updated_at = NOW()
+		 WHERE id = $1
+		 AND status = 'sending'
+		 AND claim_token = $2::uuid
+		 AND attempts = $3`,
+		job.ID,
+		job.ClaimToken,
+		job.Attempts,
+	)
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_canceled", "error").Inc()
+		return err
+	}
+	if err := ensureCurrentJobClaimUpdated(result, "mark_notification_canceled"); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(
+		dbCtx,
+		`UPDATE subscribers
+		 SET cron_claimed_until = NULL
+		 WHERE chat_id = $1`,
+		job.ChatID,
+	); err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_canceled", "error").Inc()
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_canceled", "error").Inc()
+		return err
+	}
+
+	appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_canceled", "success").Inc()
 	return nil
 }
 

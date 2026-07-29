@@ -49,12 +49,24 @@ func telegramShardIndex(chatID int64, shardCount int) int {
 	return int(idx)
 }
 
+func telegramWorkerShardIDs(workerID int, workerCount int) []int32 {
+	if workerCount < 1 || workerID < 0 || workerID >= workerCount {
+		return nil
+	}
+
+	shardIDs := make([]int32, 0, workers.TelegramUpdateShardCount/workerCount+1)
+	for shardID := workerID; shardID < workers.TelegramUpdateShardCount; shardID += workerCount {
+		shardIDs = append(shardIDs, int32(shardID))
+	}
+	return shardIDs
+}
+
 func (a *App) saveTelegramUpdate(ctx context.Context, update tgbotapi.Update, payload []byte) (bool, error) {
 	chatID, ok := telegramUpdateChatID(update)
 	if !ok {
 		chatID = 0
 	}
-	shardID := telegramShardIndex(chatID, workers.TelegramUpdateWorkerCount)
+	shardID := telegramShardIndex(chatID, workers.TelegramUpdateShardCount)
 
 	dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer dbCancel()
@@ -90,7 +102,19 @@ func (a *App) saveTelegramUpdate(ctx context.Context, update tgbotapi.Update, pa
 	return inserted > 0, nil
 }
 
-func (a *App) claimPendingTelegramUpdate(ctx context.Context, shardID int) (*TelegramUpdateJob, error) {
+func (a *App) claimPendingTelegramUpdateForWorker(
+	ctx context.Context,
+	workerID int,
+	workerCount int,
+) (*TelegramUpdateJob, error) {
+	if workerCount < 1 || workerID < 0 || workerID >= workerCount {
+		return nil, fmt.Errorf("invalid Telegram worker partition %d/%d", workerID, workerCount)
+	}
+	shardIDs := telegramWorkerShardIDs(workerID, workerCount)
+	if len(shardIDs) == 0 {
+		return nil, nil
+	}
+
 	dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer dbCancel()
 
@@ -107,7 +131,7 @@ func (a *App) claimPendingTelegramUpdate(ctx context.Context, shardID int) (*Tel
 	err = tx.QueryRowContext(dbCtx, `WITH next_update AS (
 		SELECT tu.update_id
 		FROM telegram_updates AS tu
-		WHERE tu.shard_id = $1
+		WHERE tu.shard_id = ANY($1::integer[])
 		AND tu.status IN ('pending', 'processing')
 		AND tu.next_attempt_at <= NOW()
 		AND (
@@ -135,7 +159,10 @@ func (a *App) claimPendingTelegramUpdate(ctx context.Context, shardID int) (*Tel
 		WHERE tu.update_id = next_update.update_id
 		RETURNING tu.update_id, tu.chat_id, tu.payload::text, tu.attempts
 	)
-	SELECT update_id, chat_id, payload, attempts FROM claimed`, shardID, workers.PostgresInterval(workers.TelegramUpdateClaimWindow)).Scan(
+	SELECT update_id, chat_id, payload, attempts FROM claimed`,
+		shardIDs,
+		workers.PostgresInterval(workers.TelegramUpdateClaimWindow),
+	).Scan(
 		&job.UpdateID,
 		&job.ChatID,
 		&job.Payload,
@@ -158,19 +185,32 @@ func (a *App) claimPendingTelegramUpdate(ctx context.Context, shardID int) (*Tel
 	return &job, nil
 }
 
-func (a *App) updateWorker(ctx context.Context, wg *sync.WaitGroup, shardID int) {
+func (a *App) updateWorkerPartition(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	workerID int,
+	workerCount int,
+) {
 	defer wg.Done()
 
 	pollTicker := time.NewTicker(workers.TelegramUpdatePollInterval)
 	defer pollTicker.Stop()
 
 	for {
-		job, err := a.claimPendingTelegramUpdate(ctx, shardID)
+		job, err := a.claimPendingTelegramUpdateForWorker(ctx, workerID, workerCount)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			slog.Error("failed to claim telegram update", "shard_id", shardID, "error", err)
+			slog.Error(
+				"failed to claim Telegram update",
+				"worker_id",
+				workerID,
+				"worker_count",
+				workerCount,
+				"error",
+				err,
+			)
 			select {
 			case <-pollTicker.C:
 			case <-ctx.Done():
@@ -253,6 +293,7 @@ func (a *App) processTelegramUpdateJob(ctx context.Context, job TelegramUpdateJo
 	defer releaseTelegramChatAdvisoryLock(ctx, lockConn, lockKey)
 
 	var processingErr error
+	replyCollector := &telegramReplyCollector{}
 	func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -262,8 +303,13 @@ func (a *App) processTelegramUpdateJob(ctx context.Context, job TelegramUpdateJo
 
 		processCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
+		processCtx = withTelegramReplyCollector(processCtx, replyCollector)
 		if err := a.processTelegramUpdate(processCtx, update); err != nil {
 			processingErr = err
+			return
+		}
+		if replyCollector.err != nil {
+			processingErr = fmt.Errorf("prepare Telegram reply: %w", replyCollector.err)
 		}
 	}()
 
@@ -272,7 +318,7 @@ func (a *App) processTelegramUpdateJob(ctx context.Context, job TelegramUpdateJo
 		return
 	}
 
-	if err := a.markTelegramUpdateProcessed(ctx, job); err != nil {
+	if err := a.completeTelegramUpdate(ctx, job, replyCollector.replies); err != nil {
 		if errors.Is(err, errJobOwnershipLost) {
 			slog.Warn("ignored stale telegram update success result", "update_id", job.UpdateID, "attempts", job.Attempts)
 			appmetrics.WebhookUpdatesTotal.WithLabelValues("processed_stale_claim").Inc()
@@ -314,11 +360,52 @@ func (a *App) markTelegramUpdateProcessingError(
 	appmetrics.WebhookUpdatesTotal.WithLabelValues("retry").Inc()
 }
 
-func (a *App) markTelegramUpdateProcessed(ctx context.Context, job TelegramUpdateJob) error {
+func (a *App) completeTelegramUpdate(
+	ctx context.Context,
+	job TelegramUpdateJob,
+	replies []TelegramReply,
+) error {
 	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
 	defer dbCancel()
 
-	result, err := a.db.ExecContext(
+	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "error").Inc()
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	for sequenceNo, reply := range replies {
+		if _, err := tx.ExecContext(
+			dbCtx,
+			`INSERT INTO telegram_replies (
+				source_update_id,
+				sequence_no,
+				chat_id,
+				operation,
+				message_id,
+				message_text,
+				reply_markup,
+				status,
+				next_attempt_at
+			) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::jsonb, 'pending', NOW())
+			ON CONFLICT (source_update_id, sequence_no) DO NOTHING`,
+			job.UpdateID,
+			sequenceNo,
+			reply.ChatID,
+			reply.Operation,
+			reply.MessageID,
+			reply.Text,
+			reply.ReplyMarkup,
+		); err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "error").Inc()
+			return err
+		}
+	}
+
+	result, err := tx.ExecContext(
 		dbCtx,
 		`UPDATE telegram_updates
 		 SET status = 'processed',
@@ -333,14 +420,22 @@ func (a *App) markTelegramUpdateProcessed(ctx context.Context, job TelegramUpdat
 		job.Attempts,
 	)
 	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("mark_telegram_update_processed", "error").Inc()
+		appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "error").Inc()
 		return err
 	}
-	if err := ensureCurrentJobClaimUpdated(result, "mark_telegram_update_processed"); err != nil {
+	if err := ensureCurrentJobClaimUpdated(result, "complete_telegram_update"); err != nil {
 		return err
 	}
 
-	appmetrics.DBOperationsTotal.WithLabelValues("mark_telegram_update_processed", "success").Inc()
+	if err := tx.Commit(); err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "error").Inc()
+		return err
+	}
+
+	appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "success").Inc()
+	if len(replies) > 0 {
+		appmetrics.TelegramRepliesTotal.WithLabelValues("queued").Add(float64(len(replies)))
+	}
 	return nil
 }
 

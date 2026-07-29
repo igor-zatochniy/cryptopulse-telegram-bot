@@ -41,12 +41,26 @@ var (
 		},
 		[]string{"type"},
 	)
+	TelegramRepliesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cryptopulse_telegram_replies_total",
+			Help: "Total number of durable interactive Telegram replies by result status.",
+		},
+		[]string{"status"},
+	)
 	BinanceRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "cryptopulse_binance_requests_total",
 			Help: "Total number of Binance ticker requests by symbol and result status.",
 		},
 		[]string{"symbol", "status"},
+	)
+	PriceAgeSeconds = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cryptopulse_price_age_seconds",
+			Help: "Age in seconds of the latest successfully fetched price by symbol.",
+		},
+		[]string{"symbol"},
 	)
 	DBOperationsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{

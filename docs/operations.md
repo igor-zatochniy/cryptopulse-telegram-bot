@@ -78,11 +78,13 @@ goose -dir migrations postgres "$DATABASE_URL" status
 goose -dir migrations postgres "$DATABASE_URL" up
 ```
 
+Нова версія застосунку запускається лише після перевірки обов'язкових tables і columns. Помилка `database schema incompatible` означає, що migration step потрібно завершити до deployment або rollback.
+
 Якщо production DB раніше вже отримала схему через старий ручний SQL-файл, все одно запускайте `goose up` після backup. Міграції написані з `IF NOT EXISTS` там, де це безпечно, і зафіксують поточний стан у `goose_db_version`. Якщо migration зупиниться через дублікати або неконсистентні дані, не форсуйте версію вручну: спочатку виправте дані або відновіть backup.
 
 Якщо міграції запускаються прямо на сервері Hetzner, спочатку склонуйте або оновіть репозиторій із актуальним каталогом `migrations`, потім виконайте ті самі `goose` команди з production `DATABASE_URL`.
 
-Правило для підтримки схеми: вже застосовані migration-файли не редагуються після деплою. Нова зміна схеми додається наступним номером, наприклад `007_some_schema_change.sql`.
+Правило для підтримки схеми: вже застосовані migration-файли не редагуються після деплою. Нова зміна схеми додається наступним номером, наприклад `008_some_schema_change.sql`.
 
 Після міграції перевірте ключові таблиці:
 
@@ -92,6 +94,7 @@ sudo -u postgres psql -d <database_name> -c "\d subscribers"
 sudo -u postgres psql -d <database_name> -c "\d market_prices"
 sudo -u postgres psql -d <database_name> -c "\d notification_jobs"
 sudo -u postgres psql -d <database_name> -c "\d telegram_updates"
+sudo -u postgres psql -d <database_name> -c "\d telegram_replies"
 ```
 
 ## PostgreSQL Firewall
@@ -224,13 +227,17 @@ go test -tags=integration ./...
 - permanent Telegram error -> unsubscribe;
 - transient Telegram error -> retry later без оновлення `last_sent`;
 - exhausted transient errors -> тимчасовий cooldown через `delivery_suspended_until`.
-- notification outbox retention: `sent` jobs 30 днів, `failed` jobs 90 днів.
+- unsubscribe cancellation: активний scheduled job переходить у `canceled` і не надсилається після підтвердження відписки.
+- notification outbox retention: `sent` і `canceled` jobs 30 днів, `failed` jobs 90 днів.
 - telegram webhook inbox: update зберігається до `200 OK`, worker переводить його в `processed`.
+- telegram reply outbox: send/edit відповіді фіксуються до `processed` і повторюються незалежно від команди.
+- telegram shard routing: 64 постійні logical shards розподіляються між змінною кількістю workers.
 - telegram webhook ordering: відкритий earlier update блокує claim пізнішого update того самого chat, а PostgreSQL advisory lock не дає двом replicas одночасно обробляти один chat.
 - language settings: мова читається напряму з PostgreSQL, тому replicas не тримають застаріле локальне значення.
 - notification ownership: outbox worker завершує job тільки з актуальним `claim_token`.
 - stale workers: фіналізація inbox/outbox job дозволена тільки для поточного `attempts`, тому застарілий worker не перезаписує новий claim.
 - telegram inbox retention: `processed` updates 7 днів, `failed` updates 30 днів.
+- telegram reply retention: `sent` replies 7 днів, `failed` replies 30 днів.
 
 ## Cron
 
@@ -266,7 +273,9 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - `cryptopulse_cron_deliveries_total`
 - `cryptopulse_webhook_updates_total`
 - `cryptopulse_telegram_send_errors_total`
+- `cryptopulse_telegram_replies_total`
 - `cryptopulse_binance_requests_total`
+- `cryptopulse_price_age_seconds`
 
 На що дивитися:
 
@@ -274,7 +283,9 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - часті `cron_runs_total{status="conflict"}`;
 - `webhook_updates_total{status="persist_error"}`;
 - backlog у `telegram_updates` зі статусами `pending` або `processing`;
+- backlog у `telegram_replies` зі статусами `pending` або `sending`;
 - `binance_requests_total{status!="success"}`;
+- `price_age_seconds > 60`, що означає застарілі ринкові дані;
 - DB errors у structured logs.
 
 ## Incident Playbooks
@@ -330,12 +341,14 @@ sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM notifi
 sudo -u postgres psql -d <database_name> -c "SELECT chat_id, COUNT(*) FROM notification_jobs WHERE status IN ('pending', 'sending') GROUP BY chat_id HAVING COUNT(*) > 1;"
 ```
 
-7. Перевірити webhook inbox:
+7. Перевірити webhook inbox і reply outbox:
 
 ```bash
 sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM telegram_updates GROUP BY status ORDER BY status;"
 sudo -u postgres psql -d <database_name> -c "SELECT update_id, chat_id, status, attempts, claimed_until, next_attempt_at, last_error FROM telegram_updates WHERE status IN ('pending', 'processing', 'failed') ORDER BY update_id DESC LIMIT 20;"
 sudo -u postgres psql -d <database_name> -c "SELECT chat_id, COUNT(*) FROM telegram_updates WHERE status IN ('pending', 'processing') GROUP BY chat_id HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC LIMIT 20;"
+sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM telegram_replies GROUP BY status ORDER BY status;"
+sudo -u postgres psql -d <database_name> -c "SELECT id, source_update_id, chat_id, operation, status, attempts, next_attempt_at, last_error FROM telegram_replies WHERE status IN ('pending', 'sending', 'failed') ORDER BY id DESC LIMIT 20;"
 ```
 
 ### Telegram Webhook Does Not Work
@@ -349,10 +362,11 @@ https://<service-domain>/webhook
 ```
 
 4. Перевірити, що endpoint приймає тільки `POST`.
-5. Перевірити durable inbox:
+5. Перевірити durable inbox і reply outbox:
 
 ```bash
 sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM telegram_updates GROUP BY status ORDER BY status;"
+sudo -u postgres psql -d <database_name> -c "SELECT status, COUNT(*) FROM telegram_replies GROUP BY status ORDER BY status;"
 ```
 
 ### Binance Prices Are Stale

@@ -48,9 +48,10 @@ Production-орієнтований Telegram-сервіс на Go. Він від
 
 - Telegram-команди для підписки, вибору мови, оновлення цін і керування інтервалом сповіщень.
 - Заплановані сповіщення про ціни криптовалют через автентифікований endpoint `/cron`.
-- Кеш актуальних цін на основі Binance ticker requests із збереженням у PostgreSQL.
+- Кеш цін на основі Binance ticker requests із часом отримання, попередженням про застарілі дані та збереженням у PostgreSQL.
 - Стан підписників у PostgreSQL зі schema migration, defaults, constraints та indexes.
 - Durable inbox для Telegram webhook updates з idempotency через `update_id`.
+- Durable reply outbox для повторної доставки відповідей без повторного виконання команд.
 - Повідомлення бота українською, англійською та російською мовами.
 - JSON structured logs через `log/slog`.
 - Prometheus-метрики за Bearer authentication.
@@ -136,6 +137,7 @@ cp .env.example .env
 | `CRON_SECRET` | yes | Bearer secret для `/cron`. |
 | `METRICS_SECRET` | no | Окремий Bearer secret для `/metrics`; без нього використовується `CRON_SECRET`. |
 | `PORT` | no | HTTP port. За замовчуванням `8080`. |
+| `TELEGRAM_UPDATE_WORKERS` | no | Кількість inbox workers. За замовчуванням `10`; логічні 64 shards залишаються незмінним форматом даних. |
 
 Ніколи не комітьте реальні `.env` файли або production secrets.
 
@@ -156,6 +158,8 @@ goose -dir migrations postgres "$DATABASE_URL" status
 goose -dir migrations postgres "$DATABASE_URL" up
 ```
 
+Під час запуску сервіс перевіряє наявність обов'язкових tables і columns. Якщо production schema відстає від коду, процес завершується з помилкою `database schema incompatible` замість приймання webhook або cron requests у частково працездатному стані.
+
 Якщо production DB раніше вже отримала схему через старий ручний запуск SQL, все одно запускайте `goose up` після backup. Міграції написані з `IF NOT EXISTS` там, де це безпечно, і зафіксують стан у таблиці версій `goose_db_version`.
 
 Поточний набір міграцій:
@@ -166,6 +170,8 @@ goose -dir migrations postgres "$DATABASE_URL" up
 - `004_add_outbox_retention.sql` додає retention indexes для очищення старих outbox jobs.
 - `005_add_telegram_update_inbox.sql` додає durable inbox для Telegram webhook updates.
 - `006_add_job_claim_token.sql` додає ownership token і unique active-job invariant для notification workers.
+- `007_add_telegram_reply_outbox.sql` додає durable outbox для інтерактивних Telegram send/edit відповідей.
+- `008_add_notification_job_cancellation.sql` додає terminal-статус `canceled` для сповіщень, скасованих після відписки.
 
 ## Локальна розробка
 
@@ -251,6 +257,7 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - `/cron` відхиляє unauthorized calls і overlapping runs через PostgreSQL advisory lock.
 - Permanent Telegram delivery errors відписують недоступних користувачів.
 - Transient Telegram errors не оновлюють `last_sent`, щоб дозволити наступну спробу.
+- Бот показує час останнього успішного отримання ціни та позначає дані старші за одну хвилину як застарілі.
 
 ## Нотатки З Безпеки
 
@@ -269,6 +276,8 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - Вибір cron subscribers використовує короткі database claims із `FOR UPDATE SKIP LOCKED`.
 - Cron jobs створюються як durable rows у PostgreSQL outbox.
 - Telegram webhook updates створюються як durable rows у PostgreSQL inbox.
+- Інтерактивні відповіді фіксуються в PostgreSQL reply outbox до переходу update у `processed`.
+- Transient Telegram error повторює лише reply job і не виконує state-changing команду повторно.
 - Duplicate webhook delivery не створює повторну роботу завдяки унікальному `update_id`.
 - Notification workers отримують `claim_token`; stale worker не може завершити job після повторного claim іншим worker.
 - Завершення inbox/outbox job перевіряє поточний claim state, тому stale worker не може перезаписати результат свіжого claim.
@@ -276,10 +285,13 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - Мова користувача читається з PostgreSQL під час обробки update, без локального per-replica cache.
 - Telegram sends виконуються поза database transactions.
 - Успішні sends оновлюють `last_sent`; невдалі sends не оновлюють.
+- `/unsubscribe` атомарно вимикає підписку та скасовує активний scheduled job; notification worker повторно перевіряє підписку під per-chat advisory lock.
 - Transient retry очищає subscriber claim, але pending outbox job не дозволяє створити duplicate notification.
 - Після вичерпання transient retry attempts підписник тимчасово призупиняється через `delivery_suspended_until`.
-- Outbox retention видаляє `sent` jobs після 30 днів, а `failed` jobs після 90 днів; `pending` і `sending` jobs не видаляються.
+- Outbox retention видаляє `sent` і `canceled` jobs після 30 днів, а `failed` jobs після 90 днів; `pending` і `sending` jobs не видаляються.
 - Inbox retention видаляє `processed` updates після 7 днів, а `failed` updates після 30 днів; `pending` і `processing` updates не видаляються.
+- Reply outbox retention видаляє `sent` replies після 7 днів, а `failed` replies після 30 днів.
+- `shard_id` обчислюється за постійними 64 логічними shards; змінна кількість workers детерміновано розподіляє між собою всі shards.
 - HTTP producers відстежуються через `WaitGroup` під час shutdown.
 - Після зупинки producers worker pools завершують активні jobs; незавершені inbox/outbox rows повторно підхоплюються після lease timeout.
 - Context cancellation використовується як forced fallback, якщо producers не вдалося зупинити вчасно.

@@ -30,6 +30,10 @@ func Run(ctx context.Context, cfg config.Config) error {
 	}
 	defer database.Close()
 
+	if err := storage.VerifySchema(ctx, database); err != nil {
+		return fmt.Errorf("database schema incompatible: %w", err)
+	}
+
 	telegramHTTPClient := &http.Client{Timeout: 10 * time.Second}
 	bot, err := tgbotapi.NewBotAPIWithClient(cfg.TelegramToken, tgbotapi.APIEndpoint, telegramHTTPClient)
 	if err != nil {
@@ -57,9 +61,20 @@ func Run(ctx context.Context, cfg config.Config) error {
 	go application.startNotificationRetentionCleaner(runCtx)
 
 	var telegramWG sync.WaitGroup
-	for shardID := 0; shardID < workers.TelegramUpdateWorkerCount; shardID++ {
+	for workerID := 0; workerID < cfg.TelegramUpdateWorkers; workerID++ {
 		telegramWG.Add(1)
-		go application.updateWorker(workerCtx, &telegramWG, shardID)
+		go application.updateWorkerPartition(
+			workerCtx,
+			&telegramWG,
+			workerID,
+			cfg.TelegramUpdateWorkers,
+		)
+	}
+
+	var replyWG sync.WaitGroup
+	for range workers.TelegramReplyWorkerCount {
+		replyWG.Add(1)
+		go application.replyWorker(workerCtx, &replyWG)
 	}
 
 	var notificationWG sync.WaitGroup
@@ -109,6 +124,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 
 	stopWorkers()
 	telegramWG.Wait()
+	replyWG.Wait()
 	notificationWG.Wait()
 	slog.Info("background workers stopped")
 
