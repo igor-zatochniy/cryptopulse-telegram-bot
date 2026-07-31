@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/time/rate"
+
+	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/httpserver"
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/workers"
 )
 
@@ -54,6 +57,91 @@ func TestMetricsAuthMiddleware(t *testing.T) {
 			}
 			if called != test.wantCalled {
 				t.Fatalf("called = %v, want %v", called, test.wantCalled)
+			}
+		})
+	}
+}
+
+func TestCronAuthenticationPrecedesRateLimit(t *testing.T) {
+	application := &App{cronSecret: "cron-secret"}
+	limiter := rate.NewLimiter(rate.Every(time.Hour), 1)
+	handler := application.cronAuthMiddleware(
+		httpserver.GlobalRateLimit(limiter, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	)
+
+	unauthorized := httptest.NewRequest(http.MethodPost, "/cron", nil)
+	unauthorizedRecorder := httptest.NewRecorder()
+	handler(unauthorizedRecorder, unauthorized)
+	if unauthorizedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d", unauthorizedRecorder.Code, http.StatusUnauthorized)
+	}
+
+	authorized := httptest.NewRequest(http.MethodPost, "/cron", nil)
+	authorized.Header.Set("Authorization", "Bearer cron-secret")
+	authorizedRecorder := httptest.NewRecorder()
+	handler(authorizedRecorder, authorized)
+	if authorizedRecorder.Code != http.StatusNoContent {
+		t.Fatalf("authorized status = %d, want %d", authorizedRecorder.Code, http.StatusNoContent)
+	}
+}
+
+func TestWebhookAuthenticationPrecedesClientRateLimit(t *testing.T) {
+	application := &App{webhookSecret: "webhook-secret"}
+	limiter := httpserver.NewClientRateLimiter(rate.Every(time.Hour), 1, time.Minute)
+	handler := application.webhookAuthMiddleware(
+		httpserver.ClientRateLimit(limiter, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	)
+
+	unauthorized := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+	unauthorized.RemoteAddr = "192.0.2.10:1234"
+	unauthorizedRecorder := httptest.NewRecorder()
+	handler(unauthorizedRecorder, unauthorized)
+	if unauthorizedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d", unauthorizedRecorder.Code, http.StatusUnauthorized)
+	}
+
+	authorized := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+	authorized.RemoteAddr = unauthorized.RemoteAddr
+	authorized.Header.Set("X-Telegram-Bot-Api-Secret-Token", "webhook-secret")
+	authorizedRecorder := httptest.NewRecorder()
+	handler(authorizedRecorder, authorized)
+	if authorizedRecorder.Code != http.StatusNoContent {
+		t.Fatalf("authorized status = %d, want %d", authorizedRecorder.Code, http.StatusNoContent)
+	}
+}
+
+func TestScheduledNotificationTimeUsesKyivDST(t *testing.T) {
+	kyivLocation, err := time.LoadLocation("Europe/Kyiv")
+	if err != nil {
+		t.Fatalf("load Europe/Kyiv timezone: %v", err)
+	}
+	application := &App{kyivLoc: kyivLocation}
+
+	tests := []struct {
+		name        string
+		scheduledAt time.Time
+		want        string
+	}{
+		{
+			name:        "winter uses UTC plus two",
+			scheduledAt: time.Date(2026, time.January, 15, 12, 0, 0, 0, time.UTC),
+			want:        "14:00",
+		},
+		{
+			name:        "summer uses UTC plus three",
+			scheduledAt: time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
+			want:        "15:00",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := application.formatScheduledNotificationTime(test.scheduledAt); got != test.want {
+				t.Fatalf("formatted time = %q, want %q", got, test.want)
 			}
 		})
 	}

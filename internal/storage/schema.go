@@ -96,7 +96,7 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf(
-			"missing required database objects: %s; apply goose migrations before deployment",
+			"missing required database objects after migration: %s",
 			strings.Join(missing, ", "),
 		)
 	}

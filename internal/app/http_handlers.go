@@ -46,8 +46,30 @@ func (a *App) Handler() http.Handler {
 		_, _ = w.Write([]byte("Ready"))
 	}))
 	mux.HandleFunc("/metrics", httpserver.Method(http.MethodGet, a.metricsAuthMiddleware(promhttp.Handler().ServeHTTP)))
-	mux.HandleFunc("/cron", httpserver.Method(http.MethodPost, a.producerMiddleware(httpserver.GlobalRateLimit(cronLimiter, a.handleCron))))
-	mux.HandleFunc("/webhook", httpserver.Method(http.MethodPost, a.producerMiddleware(httpserver.ClientRateLimit(webhookLimiter, a.handleWebhook))))
+	mux.HandleFunc(
+		"/cron",
+		httpserver.Method(
+			http.MethodPost,
+			a.cronAuthMiddleware(
+				httpserver.GlobalRateLimit(
+					cronLimiter,
+					a.producerMiddleware(a.handleCron),
+				),
+			),
+		),
+	)
+	mux.HandleFunc(
+		"/webhook",
+		httpserver.Method(
+			http.MethodPost,
+			a.webhookAuthMiddleware(
+				httpserver.ClientRateLimit(
+					webhookLimiter,
+					a.producerMiddleware(a.handleWebhook),
+				),
+			),
+		),
+	)
 	return mux
 }
 
@@ -98,6 +120,40 @@ func safeSecretCompare(inputToken, expectedSecret string) bool {
 	return subtle.ConstantTimeCompare([]byte(inputToken), []byte(expectedSecret)) == 1
 }
 
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(authHeader, prefix)
+}
+
+func (a *App) cronAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !safeSecretCompare(bearerToken(r), a.cronSecret) {
+			appmetrics.CronRunsTotal.WithLabelValues("unauthorized").Inc()
+			slog.Warn("unauthorized cron request", "remote_ip", r.RemoteAddr)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (a *App) webhookAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		providedSecret := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+		if !safeSecretCompare(providedSecret, a.webhookSecret) {
+			appmetrics.WebhookUpdatesTotal.WithLabelValues("unauthorized").Inc()
+			slog.Warn("unauthorized webhook request", "remote_ip", r.RemoteAddr)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (a *App) acquireCronAdvisoryLock(ctx context.Context) (*sql.Conn, bool, error) {
 	conn, err := a.db.Conn(ctx)
 	if err != nil {
@@ -135,23 +191,6 @@ func releaseCronAdvisoryLock(ctx context.Context, conn *sql.Conn) {
 }
 
 func (a *App) handleCron(w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	var providedToken string
-	if strings.HasPrefix(authHeader, "Bearer ") {
-		providedToken = authHeader[7:]
-	}
-
-	if a.cronSecret != "" && !safeSecretCompare(providedToken, a.cronSecret) {
-		appmetrics.CronRunsTotal.WithLabelValues("unauthorized").Inc()
-		slog.Warn(
-			"unauthorized block cron endpoint execution access triggered",
-			"remote_ip",
-			r.RemoteAddr,
-		)
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
 	lockConn, acquired, err := a.acquireCronAdvisoryLock(r.Context())
 	if err != nil {
 		appmetrics.CronRunsTotal.WithLabelValues("lock_error").Inc()
@@ -216,14 +255,6 @@ func (a *App) metricsAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (a *App) handleWebhook(w http.ResponseWriter, r *http.Request) {
-	providedSecret := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
-	if a.webhookSecret != "" && !safeSecretCompare(providedSecret, a.webhookSecret) {
-		appmetrics.WebhookUpdatesTotal.WithLabelValues("unauthorized").Inc()
-		slog.Warn("unauthorized webhook attempt blocked", "remote_ip", r.RemoteAddr)
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 	payload, err := io.ReadAll(r.Body)

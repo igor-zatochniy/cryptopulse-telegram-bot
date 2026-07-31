@@ -30,6 +30,14 @@ func Run(ctx context.Context, cfg config.Config) error {
 	}
 	defer database.Close()
 
+	appliedMigrations, err := storage.ApplyMigrations(ctx, database)
+	if err != nil {
+		return fmt.Errorf("database migration failed: %w", err)
+	}
+	if appliedMigrations > 0 {
+		slog.Info("database migrations applied", "count", appliedMigrations)
+	}
+
 	if err := storage.VerifySchema(ctx, database); err != nil {
 		return fmt.Errorf("database schema incompatible: %w", err)
 	}

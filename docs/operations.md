@@ -45,11 +45,12 @@ Hetzner PostgreSQL
 
 Перед деплоєм:
 
-- Переконатися, що CI green на GitHub.
+- Відкрити pull request і переконатися, що CI green до merge в `main`.
 - Перевірити, що `.env.example` не містить реальних секретів.
-- Зробити backup PostgreSQL.
-- Застосувати Goose migrations до production DB.
-- Задеплоїти новий Docker image у Koyeb.
+- Для schema changes зробити backup PostgreSQL до merge.
+- Переконатися, що нова migration є backward-compatible для поточної версії сервісу.
+- Merge в `main` і дочекатися нового Koyeb deployment.
+- Перевірити в startup logs успішне застосування migrations та schema verification.
 - Перевірити `/live`, `/ready`, `/metrics`.
 - Перевірити, що cron-job.org отримує `200 OK` від `/cron`.
 
@@ -58,19 +59,30 @@ Hetzner PostgreSQL
 Правильний порядок для змін, які зачіпають database schema:
 
 ```text
-1. Backup PostgreSQL
-2. Apply Goose migrations
-3. Deploy new Koyeb image
-4. Check /ready
-5. Check /metrics
-6. Check cron execution logs
+1. Green CI on pull request
+2. Backup PostgreSQL
+3. Merge backward-compatible migration and code
+4. Koyeb starts the new image
+5. New instance: migrate -> verify schema -> start HTTP
+6. Koyeb readiness succeeds and replaces the old deployment
+7. Check /metrics and cron execution logs
 ```
 
-Міграції потрібно застосувати до деплою нового коду, якщо код залежить від нових колонок, індексів або constraints.
+У поточній Koyeb Git-driven схемі немає окремого release job. Тому migration set вбудований у той самий binary, який запускає сервіс. PostgreSQL advisory lock не дозволяє кільком новим replicas одночасно змінювати schema. HTTP server і `/ready` запускаються тільки після `goose up` та `VerifySchema`.
+
+Цей порядок безпечний лише для expand/backward-compatible migrations. Не видаляйте columns, constraints або значення, які ще використовує попередній deployment. Destructive contract migration виконуйте окремо після повного переходу коду та перевіреного backup.
 
 ## Database Migrations
 
-Локально або з безпечного admin host:
+SQL-файли в `migrations/` вбудовуються в application binary. На startup застосунок автоматично:
+
+1. підключається до PostgreSQL;
+2. отримує session-level advisory lock для migration process;
+3. застосовує всі pending Goose migrations;
+4. перевіряє required tables і columns;
+5. лише після цього запускає HTTP server.
+
+Для ручної перевірки або аварійного адміністрування з безпечного admin host:
 
 ```bash
 go install github.com/pressly/goose/v3/cmd/goose@v3.25.0
@@ -78,11 +90,11 @@ goose -dir migrations postgres "$DATABASE_URL" status
 goose -dir migrations postgres "$DATABASE_URL" up
 ```
 
-Нова версія застосунку запускається лише після перевірки обов'язкових tables і columns. Помилка `database schema incompatible` означає, що migration step потрібно завершити до deployment або rollback.
+Помилка `database migration failed` означає, що pending migration не застосувалася. Помилка `database schema incompatible` означає, що migration set не створив schema, потрібну поточному binary. В обох випадках новий instance не стане ready; не виконуйте `goose fix` або ручне оновлення `goose_db_version` без аналізу причини.
 
-Якщо production DB раніше вже отримала схему через старий ручний SQL-файл, все одно запускайте `goose up` після backup. Міграції написані з `IF NOT EXISTS` там, де це безпечно, і зафіксують поточний стан у `goose_db_version`. Якщо migration зупиниться через дублікати або неконсистентні дані, не форсуйте версію вручну: спочатку виправте дані або відновіть backup.
+Якщо production DB раніше вже отримала схему через старий ручний SQL-файл, startup migration зафіксує сумісний стан у `goose_db_version`. Якщо migration зупиниться через дублікати або неконсистентні дані, не форсуйте версію вручну: спочатку виправте дані або відновіть backup.
 
-Якщо міграції запускаються прямо на сервері Hetzner, спочатку склонуйте або оновіть репозиторій із актуальним каталогом `migrations`, потім виконайте ті самі `goose` команди з production `DATABASE_URL`.
+Якщо міграції потрібно запустити вручну на сервері Hetzner, спочатку склонуйте або оновіть репозиторій із актуальним каталогом `migrations`, потім виконайте ті самі `goose` команди з production `DATABASE_URL`.
 
 Правило для підтримки схеми: вже застосовані migration-файли не редагуються після деплою. Нова зміна схеми додається наступним номером, наприклад `008_some_schema_change.sql`.
 

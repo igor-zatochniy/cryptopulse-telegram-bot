@@ -143,24 +143,29 @@ cp .env.example .env
 
 ## Міграції бази даних
 
-Проєкт використовує `goose`. Застосовані migration-файли не редагуються після деплою; кожна нова зміна схеми отримує наступний номер.
+Проєкт використовує `goose`. SQL-міграції вбудовуються в application binary через `embed.FS`. Під час startup новий instance:
 
-Встановіть CLI:
+```text
+connect PostgreSQL
+→ acquire migration advisory lock
+→ apply pending migrations
+→ verify required schema
+→ start HTTP server and readiness
+```
+
+Advisory lock серіалізує migration step між replicas. Якщо migration або schema verification завершується помилкою, HTTP server не запускається і новий deployment не стає ready.
+
+Перед merge зміни схеми в production-гілку потрібно зробити backup PostgreSQL. Міграції, які запускаються автоматично, мають бути backward-compatible за моделлю expand/migrate/contract: спочатку додається нова структура, потім оновлюється код і дані, а destructive cleanup виконується окремим контрольованим релізом.
+
+Для ручної перевірки status або аварійного адміністрування встановіть Goose CLI:
 
 ```bash
 go install github.com/pressly/goose/v3/cmd/goose@v3.25.0
-```
-
-Перевірте статус і застосуйте міграції перед деплоєм нової версії сервісу:
-
-```bash
 goose -dir migrations postgres "$DATABASE_URL" status
 goose -dir migrations postgres "$DATABASE_URL" up
 ```
 
-Під час запуску сервіс перевіряє наявність обов'язкових tables і columns. Якщо production schema відстає від коду, процес завершується з помилкою `database schema incompatible` замість приймання webhook або cron requests у частково працездатному стані.
-
-Якщо production DB раніше вже отримала схему через старий ручний запуск SQL, все одно запускайте `goose up` після backup. Міграції написані з `IF NOT EXISTS` там, де це безпечно, і зафіксують стан у таблиці версій `goose_db_version`.
+Застосовані migration-файли не редагуються після деплою; кожна нова зміна схеми отримує наступний номер. Якщо production DB раніше вже отримала схему через старий ручний запуск SQL, startup migration зафіксує сумісний стан у таблиці версій `goose_db_version`. При конфлікті даних не форсуйте версію вручну: виправте дані або відновіть перевірений backup.
 
 Поточний набір міграцій:
 

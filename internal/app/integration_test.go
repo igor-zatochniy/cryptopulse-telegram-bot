@@ -13,7 +13,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,7 +20,6 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/storage"
@@ -276,10 +274,7 @@ func quotePostgresIdentifier(identifier string) string {
 func applyIntegrationMigrations(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
 
-	if err := goose.SetDialect("postgres"); err != nil {
-		t.Fatalf("set goose dialect: %v", err)
-	}
-	if err := goose.UpContext(ctx, db, filepath.Join("..", "..", "migrations")); err != nil {
+	if _, err := storage.ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
 }

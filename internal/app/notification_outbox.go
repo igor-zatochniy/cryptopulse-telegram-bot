@@ -134,7 +134,10 @@ func (a *App) createCronNotificationJobs(ctx context.Context) (int, error) {
 
 	for _, due := range dueRows {
 		pricesTextLocal := a.getFormattedPricesFromCache(due.lang)
-		header := fmt.Sprintf(apptelegram.Text(due.lang, "alert_hdr"), due.at.Format("15:04"))
+		header := fmt.Sprintf(
+			apptelegram.Text(due.lang, "alert_hdr"),
+			a.formatScheduledNotificationTime(due.at),
+		)
 		text := fmt.Sprintf(
 			"%s\n\n%s\n\n_%s_",
 			header,
@@ -169,6 +172,10 @@ func (a *App) createCronNotificationJobs(ctx context.Context) (int, error) {
 
 	appmetrics.DBOperationsTotal.WithLabelValues("create_notification_jobs", "success").Inc()
 	return len(dueRows), nil
+}
+
+func (a *App) formatScheduledNotificationTime(scheduledAt time.Time) string {
+	return scheduledAt.In(a.kyivLoc).Format("15:04")
 }
 
 func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob, error) {
