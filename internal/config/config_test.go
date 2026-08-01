@@ -36,9 +36,9 @@ func TestLoadAcceptsConfiguredTelegramUpdateWorkerCount(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsTelegramUpdateWorkerCountAboveShardCount(t *testing.T) {
+func TestLoadRejectsTelegramUpdateWorkerCountAboveConnectionBudget(t *testing.T) {
 	setRequiredEnvironment(t)
-	t.Setenv("TELEGRAM_UPDATE_WORKERS", "65")
+	t.Setenv("TELEGRAM_UPDATE_WORKERS", "5")
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected invalid worker count error")

@@ -243,6 +243,7 @@ go test -tags=integration ./...
 - notification outbox retention: `sent` і `canceled` jobs 30 днів, `failed` jobs 90 днів.
 - telegram webhook inbox: update зберігається до `200 OK`, worker переводить його в `processed`.
 - telegram reply outbox: send/edit відповіді фіксуються до `processed` і повторюються незалежно від команди.
+- telegram update atomicity: mutation підписника відкочується, якщо reply outbox або inbox completion не можуть бути зафіксовані в тій самій транзакції.
 - telegram shard routing: 64 постійні logical shards розподіляються між змінною кількістю workers.
 - telegram webhook ordering: відкритий earlier update блокує claim пізнішого update того самого chat, а PostgreSQL advisory lock не дає двом replicas одночасно обробляти один chat.
 - language settings: мова читається напряму з PostgreSQL, тому replicas не тримають застаріле локальне значення.
@@ -288,6 +289,9 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - `cryptopulse_telegram_replies_total`
 - `cryptopulse_binance_requests_total`
 - `cryptopulse_price_age_seconds`
+- `cryptopulse_db_pool_connections`
+- `cryptopulse_db_pool_wait_count`
+- `cryptopulse_db_pool_wait_duration_seconds`
 
 На що дивитися:
 
@@ -298,6 +302,7 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - backlog у `telegram_replies` зі статусами `pending` або `sending`;
 - `binance_requests_total{status!="success"}`;
 - `price_age_seconds > 60`, що означає застарілі ринкові дані;
+- зростання `db_pool_wait_count` або тривале `in_use == max_open`, що означає нестачу connection budget;
 - DB errors у structured logs.
 
 ## Incident Playbooks

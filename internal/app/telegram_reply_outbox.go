@@ -42,9 +42,15 @@ type TelegramReplyJob struct {
 	Attempts    int
 }
 
+type telegramCallbackAnswer struct {
+	CallbackID string
+	Text       string
+}
+
 type telegramReplyCollector struct {
-	replies []TelegramReply
-	err     error
+	replies   []TelegramReply
+	callbacks []telegramCallbackAnswer
+	err       error
 }
 
 type telegramReplyCollectorContextKey struct{}
@@ -65,9 +71,34 @@ func (c *telegramReplyCollector) add(reply TelegramReply) {
 	c.replies = append(c.replies, reply)
 }
 
+func (c *telegramReplyCollector) addCallback(callbackID, text string) {
+	if c.err != nil {
+		return
+	}
+	c.callbacks = append(c.callbacks, telegramCallbackAnswer{
+		CallbackID: callbackID,
+		Text:       text,
+	})
+}
+
 func (c *telegramReplyCollector) setError(err error) {
 	if c.err == nil {
 		c.err = err
+	}
+}
+
+func (a *App) flushCallbackAnswers(answers []telegramCallbackAnswer) {
+	for _, answer := range answers {
+		if _, err := a.bot.Request(tgbotapi.NewCallback(answer.CallbackID, answer.Text)); err != nil {
+			appmetrics.TelegramSendErrorsTotal.WithLabelValues("callback_answer").Inc()
+			slog.Error(
+				"failed to answer callback query",
+				"callback_id",
+				answer.CallbackID,
+				"error",
+				a.safeTelegramError(err),
+			)
+		}
 	}
 }
 
@@ -224,18 +255,19 @@ func (a *App) processTelegramReply(ctx context.Context, job TelegramReplyJob) {
 		return
 	}
 
+	safeErr := a.safeTelegramError(sendErr)
 	errorType := "transient"
 	if apptelegram.IsPermanentSendError(sendErr) {
 		errorType = "permanent"
-		if err := a.markTelegramReplyFailed(ctx, job, sendErr); err != nil {
+		if err := a.markTelegramReplyFailed(ctx, job, safeErr); err != nil {
 			logTelegramReplyFinalizationError("failure", job, err)
 		}
 	} else if job.Attempts >= workers.TelegramReplyMaxAttempts {
 		errorType = "exhausted"
-		if err := a.markTelegramReplyFailed(ctx, job, sendErr); err != nil {
+		if err := a.markTelegramReplyFailed(ctx, job, safeErr); err != nil {
 			logTelegramReplyFinalizationError("failure", job, err)
 		}
-	} else if err := a.markTelegramReplyRetry(ctx, job, sendErr); err != nil {
+	} else if err := a.markTelegramReplyRetry(ctx, job, safeErr); err != nil {
 		logTelegramReplyFinalizationError("retry", job, err)
 	}
 
@@ -250,7 +282,7 @@ func (a *App) processTelegramReply(ctx context.Context, job TelegramReplyJob) {
 		"type",
 		errorType,
 		"error",
-		sendErr,
+		safeErr,
 	)
 }
 
@@ -349,6 +381,7 @@ func (a *App) markTelegramReplySent(ctx context.Context, job TelegramReplyJob) e
 func (a *App) markTelegramReplyRetry(ctx context.Context, job TelegramReplyJob, sendErr error) error {
 	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
 	defer dbCancel()
+	safeErr := a.safeTelegramError(sendErr)
 
 	result, err := a.db.ExecContext(
 		dbCtx,
@@ -365,7 +398,7 @@ func (a *App) markTelegramReplyRetry(ctx context.Context, job TelegramReplyJob, 
 		 AND attempts = $5`,
 		job.ID,
 		workers.PostgresInterval(workers.RetryDelay(job.Attempts)),
-		workers.TruncateError(sendErr.Error(), 500),
+		workers.TruncateError(safeErr.Error(), 500),
 		job.ClaimToken,
 		job.Attempts,
 	)
@@ -384,6 +417,7 @@ func (a *App) markTelegramReplyRetry(ctx context.Context, job TelegramReplyJob, 
 func (a *App) markTelegramReplyFailed(ctx context.Context, job TelegramReplyJob, sendErr error) error {
 	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
 	defer dbCancel()
+	safeErr := a.safeTelegramError(sendErr)
 
 	result, err := a.db.ExecContext(
 		dbCtx,
@@ -399,7 +433,7 @@ func (a *App) markTelegramReplyFailed(ctx context.Context, job TelegramReplyJob,
 		 AND claim_token = $3::uuid
 		 AND attempts = $4`,
 		job.ID,
-		workers.TruncateError(sendErr.Error(), 500),
+		workers.TruncateError(safeErr.Error(), 500),
 		job.ClaimToken,
 		job.Attempts,
 	)

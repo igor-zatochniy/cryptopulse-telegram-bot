@@ -7,20 +7,27 @@ import (
 )
 
 const (
-	CronBatchLimit                   = 100
-	TelegramUpdateShardCount         = 64
-	DefaultTelegramUpdateWorkerCount = 10
-	TelegramUpdatePollInterval       = 2 * time.Second
-	TelegramUpdateClaimWindow        = 45 * time.Second
-	TelegramUpdateMaxAttempts        = 3
-	TelegramUpdateProcessedRetention = 7 * 24 * time.Hour
-	TelegramUpdateFailedRetention    = 30 * 24 * time.Hour
-	TelegramReplyWorkerCount         = 5
-	TelegramReplyPollInterval        = 2 * time.Second
-	TelegramReplyClaimWindow         = 45 * time.Second
-	TelegramReplyMaxAttempts         = 3
-	TelegramReplySentRetention       = 7 * 24 * time.Hour
-	TelegramReplyFailedRetention     = 30 * 24 * time.Hour
+	DatabaseQueryPoolMaxOpenConnections = 16
+	DatabaseQueryPoolMaxIdleConnections = 8
+	DatabaseLockPoolMaxOpenConnections  = 8
+	DatabaseLockPoolMaxIdleConnections  = 2
+	NotificationWorkerCount             = 3
+	CronLockConnectionReserve           = 1
+	MaxTelegramUpdateWorkerCount        = DatabaseLockPoolMaxOpenConnections - NotificationWorkerCount - CronLockConnectionReserve
+	CronBatchLimit                      = 100
+	TelegramUpdateShardCount            = 64
+	DefaultTelegramUpdateWorkerCount    = MaxTelegramUpdateWorkerCount
+	TelegramUpdatePollInterval          = 2 * time.Second
+	TelegramUpdateClaimWindow           = 45 * time.Second
+	TelegramUpdateMaxAttempts           = 3
+	TelegramUpdateProcessedRetention    = 7 * 24 * time.Hour
+	TelegramUpdateFailedRetention       = 30 * 24 * time.Hour
+	TelegramReplyWorkerCount            = 3
+	TelegramReplyPollInterval           = 2 * time.Second
+	TelegramReplyClaimWindow            = 45 * time.Second
+	TelegramReplyMaxAttempts            = 3
+	TelegramReplySentRetention          = 7 * 24 * time.Hour
+	TelegramReplyFailedRetention        = 30 * 24 * time.Hour
 
 	// NotificationJobClaimWindow покриває 10s Telegram timeout і збереження результату в БД.
 	NotificationJobClaimWindow          = 45 * time.Second
@@ -34,6 +41,7 @@ const (
 	RetentionCleanupLimit               = 1000
 	CronAdvisoryLockKey           int64 = 0x63726f6e6c6f636b
 	TelegramChatLockPrefix              = "cryptopulse:telegram-chat:"
+	GracefulShutdownTimeout             = 30 * time.Second
 )
 
 // PostgresInterval перетворює duration на безпечний interval-параметр PostgreSQL.

@@ -238,9 +238,9 @@ func (a *App) observePriceAges(now time.Time) {
 	}
 }
 
-func (a *App) getLang(ctx context.Context, chatID int64) string {
+func (a *App) getLangWithDB(ctx context.Context, db databaseExecutor, chatID int64) string {
 	var lang string
-	err := a.db.QueryRowContext(ctx, "SELECT language_code FROM subscribers WHERE chat_id = $1", chatID).
+	err := db.QueryRowContext(ctx, "SELECT language_code FROM subscribers WHERE chat_id = $1", chatID).
 		Scan(&lang)
 	if err != nil {
 		return "ua"
@@ -253,8 +253,16 @@ func (a *App) getLang(ctx context.Context, chatID int64) string {
 }
 
 func (a *App) isSubscribed(ctx context.Context, chatID int64) (bool, error) {
+	return a.isSubscribedWithDB(ctx, a.db, chatID)
+}
+
+func (a *App) isSubscribedWithDB(
+	ctx context.Context,
+	db databaseExecutor,
+	chatID int64,
+) (bool, error) {
 	var subscribed bool
-	err := a.db.QueryRowContext(ctx, "SELECT is_subscribed FROM subscribers WHERE chat_id = $1", chatID).
+	err := db.QueryRowContext(ctx, "SELECT is_subscribed FROM subscribers WHERE chat_id = $1", chatID).
 		Scan(&subscribed)
 	if errors.Is(err, sql.ErrNoRows) {
 		appmetrics.DBOperationsTotal.WithLabelValues("check_subscription", "not_found").Inc()

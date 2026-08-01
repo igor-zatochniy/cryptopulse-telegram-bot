@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -15,7 +14,11 @@ import (
 	apptelegram "github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/telegram"
 )
 
-func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update) (processErr error) {
+func (a *App) processTelegramUpdateWithDB(
+	ctx context.Context,
+	db databaseExecutor,
+	update tgbotapi.Update,
+) (processErr error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -44,11 +47,11 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 					"payload",
 					newLang,
 				)
-				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Invalid Language"))
+				a.answerCallback(ctx, callbackID, "Invalid Language")
 				return
 			}
 
-			if _, err := a.db.ExecContext(ctx, `INSERT INTO subscribers (chat_id, interval_minutes, last_sent, language_code, is_subscribed)
+			if _, err := db.ExecContext(ctx, `INSERT INTO subscribers (chat_id, interval_minutes, last_sent, language_code, is_subscribed)
                      VALUES ($1, 60, NOW() - INTERVAL '2 minute', $2, FALSE)
                      ON CONFLICT (chat_id) DO UPDATE SET language_code = EXCLUDED.language_code`, chatID, newLang); err != nil {
 				appmetrics.DBOperationsTotal.WithLabelValues("set_language", "error").Inc()
@@ -59,18 +62,18 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 					"error",
 					err,
 				)
-				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Error"))
+				a.answerCallback(ctx, callbackID, "Error")
 				a.sendSafeMessage(ctx, chatID, apptelegram.Text("ua", "db_err"), nil)
 				return err
 			}
 
 			appmetrics.DBOperationsTotal.WithLabelValues("set_language", "success").Inc()
-			a.acknowledgeCallback(callbackID)
+			a.acknowledgeCallback(ctx, callbackID)
 			a.sendSafeMessage(ctx, chatID, apptelegram.Text(newLang, "lang_fixed"), nil)
 			return
 		}
 
-		lang := a.getLang(ctx, chatID)
+		lang := a.getLangWithDB(ctx, db, chatID)
 
 		if strings.HasPrefix(data, "int_") {
 			minutes, err := strconv.Atoi(data[4:])
@@ -83,11 +86,11 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 						slog.String("payload", data),
 					),
 				)
-				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Invalid Range"))
+				a.answerCallback(ctx, callbackID, "Invalid Range")
 				return
 			}
 
-			result, err := a.db.ExecContext(ctx, "UPDATE subscribers SET interval_minutes = $1, last_sent = NOW() WHERE chat_id = $2 AND is_subscribed = TRUE", minutes, chatID)
+			result, err := db.ExecContext(ctx, "UPDATE subscribers SET interval_minutes = $1, last_sent = NOW() WHERE chat_id = $2 AND is_subscribed = TRUE", minutes, chatID)
 			if err != nil {
 				appmetrics.DBOperationsTotal.WithLabelValues("update_interval", "error").Inc()
 				slog.Error(
@@ -97,7 +100,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 					"error",
 					err,
 				)
-				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Error"))
+				a.answerCallback(ctx, callbackID, "Error")
 				a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "db_err"), nil)
 				return err
 			}
@@ -112,7 +115,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 					"error",
 					err,
 				)
-				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, "Error"))
+				a.answerCallback(ctx, callbackID, "Error")
 				a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "db_err"), nil)
 				return err
 			}
@@ -120,7 +123,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 			if affectedRows == 0 {
 				appmetrics.DBOperationsTotal.WithLabelValues("update_interval", "inactive").Inc()
 				slog.Info("interval update rejected for inactive subscriber", "chat_id", chatID)
-				_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, apptelegram.Text(lang, "subscribe_first")))
+				a.answerCallback(ctx, callbackID, apptelegram.Text(lang, "subscribe_first"))
 				a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "subscribe_first"), nil)
 				return
 			}
@@ -132,7 +135,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 				unit = apptelegram.Text(lang, "unit_h")
 				val = minutes / 60
 			}
-			a.acknowledgeCallback(callbackID)
+			a.acknowledgeCallback(ctx, callbackID)
 			a.sendSafeMessage(ctx, chatID, fmt.Sprintf(apptelegram.Text(lang, "interval_set"), val, unit), nil)
 			return
 		}
@@ -152,7 +155,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 				text,
 				apptelegram.RefreshKeyboard(lang),
 			)
-			a.acknowledgeCallback(callbackID)
+			a.acknowledgeCallback(ctx, callbackID)
 		}
 		return
 	}
@@ -161,7 +164,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 		return
 	}
 	chatID := update.Message.Chat.ID
-	lang := a.getLang(ctx, chatID)
+	lang := a.getLangWithDB(ctx, db, chatID)
 
 	cmd := update.Message.Command()
 	if strings.Contains(cmd, "@") {
@@ -174,7 +177,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 	case "language":
 		a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "lang_sel"), apptelegram.LanguageKeyboard())
 	case "subscribe":
-		if _, err := a.db.ExecContext(ctx, `INSERT INTO subscribers (chat_id, interval_minutes, last_sent, language_code, is_subscribed)
+		if _, err := db.ExecContext(ctx, `INSERT INTO subscribers (chat_id, interval_minutes, last_sent, language_code, is_subscribed)
                  VALUES ($1, 60, NOW() - INTERVAL '2 minute', $2, TRUE)
                  ON CONFLICT (chat_id) DO UPDATE SET
                      interval_minutes = COALESCE(subscribers.interval_minutes, EXCLUDED.interval_minutes),
@@ -190,7 +193,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 		appmetrics.DBOperationsTotal.WithLabelValues("subscribe", "success").Inc()
 		a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "subscribe"), nil)
 	case "unsubscribe":
-		if err := a.unsubscribe(ctx, chatID); err != nil {
+		if err := a.unsubscribe(ctx, db, chatID); err != nil {
 			appmetrics.DBOperationsTotal.WithLabelValues("unsubscribe", "error").Inc()
 			slog.Error("deactivation sql command failed", "chat_id", chatID, "error", err)
 			a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "db_err"), nil)
@@ -199,7 +202,7 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 		appmetrics.DBOperationsTotal.WithLabelValues("unsubscribe", "success").Inc()
 		a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "unsubscribe"), nil)
 	case "interval":
-		subscribed, err := a.isSubscribed(ctx, chatID)
+		subscribed, err := a.isSubscribedWithDB(ctx, db, chatID)
 		if err != nil {
 			slog.Error("failed to check subscription status before interval menu", "chat_id", chatID, "error", err)
 			a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "db_err"), nil)
@@ -220,16 +223,8 @@ func (a *App) processTelegramUpdate(ctx context.Context, update tgbotapi.Update)
 	return nil
 }
 
-func (a *App) unsubscribe(ctx context.Context, chatID int64) error {
-	tx, err := a.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	if _, err := tx.ExecContext(
+func (a *App) unsubscribe(ctx context.Context, db databaseExecutor, chatID int64) error {
+	if _, err := db.ExecContext(
 		ctx,
 		`UPDATE subscribers
 		 SET is_subscribed = FALSE,
@@ -241,7 +236,7 @@ func (a *App) unsubscribe(ctx context.Context, chatID int64) error {
 		return err
 	}
 
-	if _, err := tx.ExecContext(
+	if _, err := db.ExecContext(
 		ctx,
 		`UPDATE notification_jobs
 		 SET status = 'canceled',
@@ -257,5 +252,5 @@ func (a *App) unsubscribe(ctx context.Context, chatID int64) error {
 		return err
 	}
 
-	return tx.Commit()
+	return nil
 }

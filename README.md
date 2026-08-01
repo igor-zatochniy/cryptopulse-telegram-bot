@@ -137,7 +137,7 @@ cp .env.example .env
 | `CRON_SECRET` | yes | Bearer secret для `/cron`. |
 | `METRICS_SECRET` | no | Окремий Bearer secret для `/metrics`; без нього використовується `CRON_SECRET`. |
 | `PORT` | no | HTTP port. За замовчуванням `8080`. |
-| `TELEGRAM_UPDATE_WORKERS` | no | Кількість inbox workers. За замовчуванням `10`; логічні 64 shards залишаються незмінним форматом даних. |
+| `TELEGRAM_UPDATE_WORKERS` | no | Кількість inbox workers від `1` до `4`. За замовчуванням `4`; логічні 64 shards залишаються незмінним форматом даних. |
 
 Ніколи не комітьте реальні `.env` файли або production secrets.
 
@@ -282,6 +282,7 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - Cron jobs створюються як durable rows у PostgreSQL outbox.
 - Telegram webhook updates створюються як durable rows у PostgreSQL inbox.
 - Інтерактивні відповіді фіксуються в PostgreSQL reply outbox до переходу update у `processed`.
+- Command mutation, reply outbox rows і перехід inbox update у `processed` фіксуються однією PostgreSQL-транзакцією.
 - Transient Telegram error повторює лише reply job і не виконує state-changing команду повторно.
 - Duplicate webhook delivery не створює повторну роботу завдяки унікальному `update_id`.
 - Notification workers отримують `claim_token`; stale worker не може завершити job після повторного claim іншим worker.
@@ -297,9 +298,11 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - Inbox retention видаляє `processed` updates після 7 днів, а `failed` updates після 30 днів; `pending` і `processing` updates не видаляються.
 - Reply outbox retention видаляє `sent` replies після 7 днів, а `failed` replies після 30 днів.
 - `shard_id` обчислюється за постійними 64 логічними shards; змінна кількість workers детерміновано розподіляє між собою всі shards.
-- HTTP producers відстежуються через `WaitGroup` під час shutdown.
-- Після зупинки producers worker pools завершують активні jobs; незавершені inbox/outbox rows повторно підхоплюються після lease timeout.
-- Context cancellation використовується як forced fallback, якщо producers не вдалося зупинити вчасно.
+- Query operations і session-level advisory locks використовують окремі PostgreSQL pools із сумарним лімітом 24 connections на replica.
+- Lock budget покриває 4 update workers, 3 notification workers і 1 cron advisory lock; перевищення worker limit відхиляється під час завантаження config.
+- HTTP server, price ticker, retention cleaner та всі worker pools відстежуються спільним `WaitGroup`.
+- Єдиний 30-секундний shutdown budget охоплює HTTP shutdown, producer drain і worker drain; DB закривається тільки після завершення tracked goroutines.
+- Незавершені inbox/outbox rows повторно підхоплюються після lease timeout.
 
 ## Ключові Інженерні Рішення
 

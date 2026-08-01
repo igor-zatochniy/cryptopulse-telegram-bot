@@ -2,6 +2,8 @@
 package metrics
 
 import (
+	"database/sql"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -69,4 +71,40 @@ var (
 		},
 		[]string{"operation", "status"},
 	)
+	DBPoolConnections = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cryptopulse_db_pool_connections",
+			Help: "Current PostgreSQL connection count by pool and state.",
+		},
+		[]string{"pool", "state"},
+	)
+	DBPoolWaitCount = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cryptopulse_db_pool_wait_count",
+			Help: "Cumulative number of waits for a PostgreSQL connection by pool.",
+		},
+		[]string{"pool"},
+	)
+	DBPoolWaitDurationSeconds = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cryptopulse_db_pool_wait_duration_seconds",
+			Help: "Cumulative time spent waiting for PostgreSQL connections by pool.",
+		},
+		[]string{"pool"},
+	)
 )
+
+// ObserveDBPool оновлює metrics без окремої polling goroutine безпосередньо перед scrape.
+func ObserveDBPool(poolName string, db *sql.DB) {
+	if db == nil {
+		return
+	}
+
+	stats := db.Stats()
+	DBPoolConnections.WithLabelValues(poolName, "open").Set(float64(stats.OpenConnections))
+	DBPoolConnections.WithLabelValues(poolName, "in_use").Set(float64(stats.InUse))
+	DBPoolConnections.WithLabelValues(poolName, "idle").Set(float64(stats.Idle))
+	DBPoolConnections.WithLabelValues(poolName, "max_open").Set(float64(stats.MaxOpenConnections))
+	DBPoolWaitCount.WithLabelValues(poolName).Set(float64(stats.WaitCount))
+	DBPoolWaitDurationSeconds.WithLabelValues(poolName).Set(stats.WaitDuration.Seconds())
+}

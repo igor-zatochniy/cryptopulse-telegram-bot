@@ -26,6 +26,7 @@ import (
 func (a *App) Handler() http.Handler {
 	cronLimiter := rate.NewLimiter(rate.Every(30*time.Second), 5)
 	webhookLimiter := httpserver.NewClientRateLimiter(rate.Limit(50), 100, 10*time.Minute)
+	metricsHandler := promhttp.Handler()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/live", httpserver.Method(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) {
@@ -45,7 +46,11 @@ func (a *App) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Ready"))
 	}))
-	mux.HandleFunc("/metrics", httpserver.Method(http.MethodGet, a.metricsAuthMiddleware(promhttp.Handler().ServeHTTP)))
+	mux.HandleFunc("/metrics", httpserver.Method(http.MethodGet, a.metricsAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		appmetrics.ObserveDBPool("query", a.db)
+		appmetrics.ObserveDBPool("lock", a.lockDatabase())
+		metricsHandler.ServeHTTP(w, r)
+	})))
 	mux.HandleFunc(
 		"/cron",
 		httpserver.Method(
@@ -155,7 +160,7 @@ func (a *App) webhookAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (a *App) acquireCronAdvisoryLock(ctx context.Context) (*sql.Conn, bool, error) {
-	conn, err := a.db.Conn(ctx)
+	conn, err := a.lockDatabase().Conn(ctx)
 	if err != nil {
 		return nil, false, err
 	}

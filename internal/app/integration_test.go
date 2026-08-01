@@ -279,6 +279,26 @@ func applyIntegrationMigrations(t *testing.T, ctx context.Context, db *sql.DB) {
 	}
 }
 
+func completeTelegramUpdateForTest(
+	ctx context.Context,
+	app *App,
+	job TelegramUpdateJob,
+	replies []TelegramReply,
+) error {
+	tx, err := app.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if err := app.completeTelegramUpdateTx(ctx, tx, job, replies); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func skipOrFailUnavailableTestcontainer(t *testing.T, err error) {
 	t.Helper()
 
@@ -325,7 +345,7 @@ func TestIntegrationSubscribeAfterLanguageSelection(t *testing.T) {
 
 	const chatID int64 = 101
 
-	app.processTelegramUpdate(context.Background(), tgbotapi.Update{
+	app.processTelegramUpdateWithDB(context.Background(), app.db, tgbotapi.Update{
 		CallbackQuery: &tgbotapi.CallbackQuery{
 			ID:   "set-language",
 			Data: "setlang_en",
@@ -337,7 +357,7 @@ func TestIntegrationSubscribeAfterLanguageSelection(t *testing.T) {
 
 	assertSubscriberState(t, db, chatID, false, 60, "en")
 
-	app.processTelegramUpdate(context.Background(), tgbotapi.Update{
+	app.processTelegramUpdateWithDB(context.Background(), app.db, tgbotapi.Update{
 		Message: &tgbotapi.Message{
 			Text: "/subscribe",
 			Chat: &tgbotapi.Chat{ID: chatID},
@@ -359,17 +379,17 @@ func TestIntegrationLanguageLookupReadsCurrentDatabaseAcrossReplicas(t *testing.
 
 	const chatID int64 = 102
 
-	if err := appA.processTelegramUpdate(context.Background(), languageCallbackUpdate(chatID, "set-language-en", "setlang_en")); err != nil {
+	if err := appA.processTelegramUpdateWithDB(context.Background(), appA.db, languageCallbackUpdate(chatID, "set-language-en", "setlang_en")); err != nil {
 		t.Fatalf("set language to en: %v", err)
 	}
-	if got := appB.getLang(context.Background(), chatID); got != "en" {
+	if got := appB.getLangWithDB(context.Background(), appB.db, chatID); got != "en" {
 		t.Fatalf("replica B language after first change = %q, want en", got)
 	}
 
-	if err := appA.processTelegramUpdate(context.Background(), languageCallbackUpdate(chatID, "set-language-ru", "setlang_ru")); err != nil {
+	if err := appA.processTelegramUpdateWithDB(context.Background(), appA.db, languageCallbackUpdate(chatID, "set-language-ru", "setlang_ru")); err != nil {
 		t.Fatalf("set language to ru: %v", err)
 	}
-	if got := appB.getLang(context.Background(), chatID); got != "ru" {
+	if got := appB.getLangWithDB(context.Background(), appB.db, chatID); got != "ru" {
 		t.Fatalf("replica B language after second change = %q, want ru", got)
 	}
 }
@@ -381,7 +401,7 @@ func TestIntegrationIntervalRequiresSubscriptionAndUpdatesSubscribedUser(t *test
 
 	const inactiveChatID int64 = 201
 
-	app.processTelegramUpdate(context.Background(), tgbotapi.Update{
+	app.processTelegramUpdateWithDB(context.Background(), app.db, tgbotapi.Update{
 		Message: &tgbotapi.Message{
 			Text: "/interval",
 			Chat: &tgbotapi.Chat{ID: inactiveChatID},
@@ -397,7 +417,7 @@ func TestIntegrationIntervalRequiresSubscriptionAndUpdatesSubscribedUser(t *test
 	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
 	insertSubscriber(t, db, activeChatID, true, 60, "ua", oldLastSent)
 
-	app.processTelegramUpdate(context.Background(), tgbotapi.Update{
+	app.processTelegramUpdateWithDB(context.Background(), app.db, tgbotapi.Update{
 		CallbackQuery: &tgbotapi.CallbackQuery{
 			ID:   "set-interval",
 			Data: "int_5",
@@ -495,6 +515,40 @@ func TestIntegrationTelegramUpdateWorkerProcessesDurableInbox(t *testing.T) {
 
 	waitForSubscribed(t, db, chatID, true)
 	waitForTelegramUpdateStatus(t, db, 30002, "processed")
+}
+
+func TestIntegrationTelegramUpdateMutationRollsBackWhenReplyPersistenceFails(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 314
+	const updateID int64 = 39999
+	if _, err := db.Exec(`ALTER TABLE telegram_replies
+		ADD CONSTRAINT telegram_replies_reject_atomicity_test
+		CHECK (source_update_id <> 39999)`); err != nil {
+		t.Fatalf("install reply failure constraint: %v", err)
+	}
+
+	saveIntegrationTelegramUpdate(t, app, commandUpdateWithID(int(updateID), chatID, "/subscribe"))
+	job, err := app.claimPendingTelegramUpdateForWorker(
+		context.Background(),
+		telegramShardIndex(chatID, workers.TelegramUpdateShardCount),
+		workers.TelegramUpdateShardCount,
+	)
+	if err != nil {
+		t.Fatalf("claim Telegram update: %v", err)
+	}
+	if job == nil {
+		t.Fatal("Telegram update claim returned nil")
+	}
+
+	app.processTelegramUpdateJob(context.Background(), *job)
+
+	assertNoSubscriberRow(t, db, chatID)
+	assertTelegramUpdateStatus(t, db, updateID, "pending")
+	assertTelegramUpdateAttempts(t, db, updateID, 1)
+	assertTelegramReplyCount(t, db, updateID, 0)
 }
 
 func TestIntegrationTelegramReplyRetriesWithoutRepeatingCommand(t *testing.T) {
@@ -646,7 +700,7 @@ func TestIntegrationTelegramInboxClaimsPreserveSameChatOrderAcrossReplicas(t *te
 		t.Fatalf("second replica claimed update %d while earlier update %d is still processing", secondJob.UpdateID, firstUpdateID)
 	}
 
-	if err := appA.completeTelegramUpdate(context.Background(), *firstJob, nil); err != nil {
+	if err := completeTelegramUpdateForTest(context.Background(), appA, *firstJob, nil); err != nil {
 		t.Fatalf("mark first telegram update processed: %v", err)
 	}
 
@@ -741,7 +795,7 @@ func TestIntegrationStaleTelegramUpdateClaimCannotMarkProcessed(t *testing.T) {
 		t.Fatalf("simulate newer telegram update claim: %v", err)
 	}
 
-	err = app.completeTelegramUpdate(context.Background(), *job, nil)
+	err = completeTelegramUpdateForTest(context.Background(), app, *job, nil)
 	if !errors.Is(err, errJobOwnershipLost) {
 		t.Fatalf("mark stale telegram update processed error = %v, want %v", err, errJobOwnershipLost)
 	}
@@ -827,6 +881,55 @@ func TestIntegrationCronClaimAndTelegramDeliveryOutcomes(t *testing.T) {
 	assertLastSentUnchanged(t, db, 303, oldLastSent)
 	assertClaimCleared(t, db, 303)
 	assertSubscribed(t, db, 303, false)
+}
+
+func TestIntegrationTelegramTokenIsRedactedBeforePersistingDeliveryError(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 315
+	oldLastSent := time.Now().Add(-2 * time.Hour).UTC()
+	insertSubscriber(t, db, chatID, true, 1, "ua", oldLastSent)
+
+	created, err := app.createCronNotificationJobs(context.Background())
+	if err != nil {
+		t.Fatalf("create cron notification job: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created jobs = %d, want 1", created)
+	}
+
+	job, err := app.claimPendingNotificationJob(context.Background())
+	if err != nil {
+		t.Fatalf("claim notification job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("notification job claim returned nil")
+	}
+
+	transportErr := &url.Error{
+		Op:  "Post",
+		URL: "https://api.telegram.org/bot" + integrationBotToken + "/sendMessage",
+		Err: context.DeadlineExceeded,
+	}
+	if err := app.markNotificationJobRetry(context.Background(), *job, transportErr); err != nil {
+		t.Fatalf("mark notification job retry: %v", err)
+	}
+
+	var lastError string
+	if err := db.QueryRow(
+		"SELECT last_error FROM notification_jobs WHERE id = $1",
+		job.ID,
+	).Scan(&lastError); err != nil {
+		t.Fatalf("read notification job error: %v", err)
+	}
+	if strings.Contains(lastError, integrationBotToken) {
+		t.Fatalf("persisted error contains Telegram token: %q", lastError)
+	}
+	if !strings.Contains(lastError, redactedTelegramToken) {
+		t.Fatalf("persisted error does not contain redaction marker: %q", lastError)
+	}
 }
 
 func TestIntegrationCronReturnsBeforeTelegramDeliveryCompletes(t *testing.T) {
@@ -1061,7 +1164,7 @@ func TestIntegrationUnsubscribeCancelsPendingNotification(t *testing.T) {
 		t.Fatalf("created jobs = %d, want 1", created)
 	}
 
-	if err := app.processTelegramUpdate(context.Background(), commandUpdate(chatID, "/unsubscribe")); err != nil {
+	if err := app.processTelegramUpdateWithDB(context.Background(), app.db, commandUpdate(chatID, "/unsubscribe")); err != nil {
 		t.Fatalf("process unsubscribe: %v", err)
 	}
 

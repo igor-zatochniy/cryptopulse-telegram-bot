@@ -240,7 +240,7 @@ func telegramChatAdvisoryLockKey(chatID int64) int64 {
 }
 
 func (a *App) acquireTelegramChatAdvisoryLock(ctx context.Context, chatID int64) (*sql.Conn, int64, error) {
-	conn, err := a.db.Conn(ctx)
+	conn, err := a.lockDatabase().Conn(ctx)
 	if err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("acquire_telegram_chat_lock", "error").Inc()
 		return nil, 0, err
@@ -292,6 +292,18 @@ func (a *App) processTelegramUpdateJob(ctx context.Context, job TelegramUpdateJo
 	}
 	defer releaseTelegramChatAdvisoryLock(ctx, lockConn, lockKey)
 
+	processCtx, processCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer processCancel()
+
+	tx, err := a.db.BeginTx(processCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		a.markTelegramUpdateProcessingError(ctx, job, fmt.Errorf("begin telegram update transaction: %w", err))
+		return
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
 	var processingErr error
 	replyCollector := &telegramReplyCollector{}
 	func() {
@@ -301,10 +313,8 @@ func (a *App) processTelegramUpdateJob(ctx context.Context, job TelegramUpdateJo
 			}
 		}()
 
-		processCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
 		processCtx = withTelegramReplyCollector(processCtx, replyCollector)
-		if err := a.processTelegramUpdate(processCtx, update); err != nil {
+		if err := a.processTelegramUpdateWithDB(processCtx, tx, update); err != nil {
 			processingErr = err
 			return
 		}
@@ -314,11 +324,13 @@ func (a *App) processTelegramUpdateJob(ctx context.Context, job TelegramUpdateJo
 	}()
 
 	if processingErr != nil {
+		_ = tx.Rollback()
 		a.markTelegramUpdateProcessingError(ctx, job, processingErr)
 		return
 	}
 
-	if err := a.completeTelegramUpdate(ctx, job, replyCollector.replies); err != nil {
+	if err := a.completeTelegramUpdateTx(processCtx, tx, job, replyCollector.replies); err != nil {
+		_ = tx.Rollback()
 		if errors.Is(err, errJobOwnershipLost) {
 			slog.Warn("ignored stale telegram update success result", "update_id", job.UpdateID, "attempts", job.Attempts)
 			appmetrics.WebhookUpdatesTotal.WithLabelValues("processed_stale_claim").Inc()
@@ -327,9 +339,18 @@ func (a *App) processTelegramUpdateJob(ctx context.Context, job TelegramUpdateJo
 
 		slog.Error("failed to persist processed telegram update", "update_id", job.UpdateID, "error", err)
 		appmetrics.WebhookUpdatesTotal.WithLabelValues("processed_persist_error").Inc()
+		a.markTelegramUpdateProcessingError(ctx, job, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "error").Inc()
+		slog.Error("failed to commit processed telegram update", "update_id", job.UpdateID, "error", err)
+		a.markTelegramUpdateProcessingError(ctx, job, err)
 		return
 	}
 
+	observeCompletedTelegramUpdate(len(replyCollector.replies))
+	a.flushCallbackAnswers(replyCollector.callbacks)
 	appmetrics.WebhookUpdatesTotal.WithLabelValues("processed").Inc()
 }
 
@@ -360,26 +381,16 @@ func (a *App) markTelegramUpdateProcessingError(
 	appmetrics.WebhookUpdatesTotal.WithLabelValues("retry").Inc()
 }
 
-func (a *App) completeTelegramUpdate(
+func (a *App) completeTelegramUpdateTx(
 	ctx context.Context,
+	tx *sql.Tx,
 	job TelegramUpdateJob,
 	replies []TelegramReply,
 ) error {
-	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
-	defer dbCancel()
-
-	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "error").Inc()
-		return err
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
 
 	for sequenceNo, reply := range replies {
 		if _, err := tx.ExecContext(
-			dbCtx,
+			ctx,
 			`INSERT INTO telegram_replies (
 				source_update_id,
 				sequence_no,
@@ -406,7 +417,7 @@ func (a *App) completeTelegramUpdate(
 	}
 
 	result, err := tx.ExecContext(
-		dbCtx,
+		ctx,
 		`UPDATE telegram_updates
 		 SET status = 'processed',
 		     processed_at = NOW(),
@@ -427,16 +438,14 @@ func (a *App) completeTelegramUpdate(
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "error").Inc()
-		return err
-	}
-
-	appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "success").Inc()
-	if len(replies) > 0 {
-		appmetrics.TelegramRepliesTotal.WithLabelValues("queued").Add(float64(len(replies)))
-	}
 	return nil
+}
+
+func observeCompletedTelegramUpdate(replyCount int) {
+	appmetrics.DBOperationsTotal.WithLabelValues("complete_telegram_update", "success").Inc()
+	if replyCount > 0 {
+		appmetrics.TelegramRepliesTotal.WithLabelValues("queued").Add(float64(replyCount))
+	}
 }
 
 func (a *App) markTelegramUpdateRetry(

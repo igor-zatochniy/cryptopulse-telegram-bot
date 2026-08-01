@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,6 +166,33 @@ func TestFinalizationContextSurvivesParentCancellation(t *testing.T) {
 	}
 	if got := finalCtx.Value(requestIDKey); got != "req-42" {
 		t.Fatalf("request id = %v, want req-42", got)
+	}
+}
+
+func TestTrackedRuntimeWaitsForGoroutineCompletion(t *testing.T) {
+	var wg sync.WaitGroup
+	release := make(chan struct{})
+	startTracked(&wg, func() {
+		<-release
+	})
+
+	close(release)
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := waitForWaitGroup(waitCtx, &wg); err != nil {
+		t.Fatalf("wait for tracked goroutine: %v", err)
+	}
+}
+
+func TestRuntimeWaitHonorsShutdownBudget(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer wg.Done()
+
+	waitCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitForWaitGroup(waitCtx, &wg); !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait error = %v, want %v", err, context.Canceled)
 	}
 }
 

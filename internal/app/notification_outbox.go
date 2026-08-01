@@ -282,11 +282,12 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 
 	if _, err := a.bot.Send(msg); err != nil {
 		errorType := "transient"
-		slog.Error("failed to send scheduled alert", "chat_id", job.ChatID, "error", err)
+		safeErr := a.safeTelegramError(err)
+		slog.Error("failed to send scheduled alert", "chat_id", job.ChatID, "error", safeErr)
 
 		if apptelegram.IsPermanentSendError(err) {
 			errorType = "permanent"
-			if markErr := a.markNotificationJobFailed(ctx, job, err, true); markErr != nil {
+			if markErr := a.markNotificationJobFailed(ctx, job, safeErr, true); markErr != nil {
 				if errors.Is(markErr, errJobOwnershipLost) {
 					slog.Warn("ignored stale notification failure result", "job_id", job.ID, "attempts", job.Attempts)
 				} else {
@@ -295,7 +296,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 			}
 		} else if job.Attempts >= workers.NotificationJobMaxAttempts {
 			errorType = "exhausted"
-			if markErr := a.markNotificationJobFailed(ctx, job, err, false); markErr != nil {
+			if markErr := a.markNotificationJobFailed(ctx, job, safeErr, false); markErr != nil {
 				if errors.Is(markErr, errJobOwnershipLost) {
 					slog.Warn("ignored stale notification failure result", "job_id", job.ID, "attempts", job.Attempts)
 				} else {
@@ -303,7 +304,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 				}
 			}
 		} else {
-			if markErr := a.markNotificationJobRetry(ctx, job, err); markErr != nil {
+			if markErr := a.markNotificationJobRetry(ctx, job, safeErr); markErr != nil {
 				if errors.Is(markErr, errJobOwnershipLost) {
 					slog.Warn("ignored stale notification retry result", "job_id", job.ID, "attempts", job.Attempts)
 				} else {
@@ -419,6 +420,7 @@ func (a *App) markNotificationJobSent(ctx context.Context, job NotificationJob) 
 func (a *App) markNotificationJobRetry(ctx context.Context, job NotificationJob, sendErr error) error {
 	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
 	defer dbCancel()
+	safeErr := a.safeTelegramError(sendErr)
 
 	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -445,7 +447,7 @@ func (a *App) markNotificationJobRetry(ctx context.Context, job NotificationJob,
 		 AND attempts = $5`,
 		job.ID,
 		workers.PostgresInterval(delay),
-		workers.TruncateError(sendErr.Error(), 500),
+		workers.TruncateError(safeErr.Error(), 500),
 		job.ClaimToken,
 		job.Attempts,
 	)
@@ -545,6 +547,7 @@ func (a *App) markNotificationJobFailed(
 ) error {
 	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
 	defer dbCancel()
+	safeErr := a.safeTelegramError(sendErr)
 
 	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -569,7 +572,7 @@ func (a *App) markNotificationJobFailed(
 		 AND claim_token = $3::uuid
 		 AND attempts = $4`,
 		job.ID,
-		workers.TruncateError(sendErr.Error(), 500),
+		workers.TruncateError(safeErr.Error(), 500),
 		job.ClaimToken,
 		job.Attempts,
 	)

@@ -85,10 +85,16 @@ type TelegramUpdateJob struct {
 	Attempts int
 }
 
+type databaseExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // --- СТРУКТУРА ЗАСТОСУНКУ (DEPENDENCY INJECTION) ---
 
 type App struct {
 	db            *sql.DB
+	lockDB        *sql.DB
 	bot           *tgbotapi.BotAPI
 	priceCache    *PriceCache
 	kyivLoc       *time.Location
@@ -99,6 +105,13 @@ type App struct {
 	producerMu    sync.Mutex
 	producerWG    sync.WaitGroup
 	shuttingDown  bool
+}
+
+func (a *App) lockDatabase() *sql.DB {
+	if a.lockDB != nil {
+		return a.lockDB
+	}
+	return a.db
 }
 
 var trackedCoins = []struct {
@@ -139,7 +152,7 @@ func (a *App) sendSafeMessage(ctx context.Context, chatID int64, text string, ma
 	}
 	if _, err := a.bot.Send(msg); err != nil {
 		appmetrics.TelegramSendErrorsTotal.WithLabelValues("interactive_message").Inc()
-		slog.Error("failed to send message", "chat_id", chatID, "error", err)
+		slog.Error("failed to send message", "chat_id", chatID, "error", a.safeTelegramError(err))
 	}
 }
 
@@ -180,14 +193,26 @@ func (a *App) editSafeMessage(
 			"chat_id",
 			chatID,
 			"error",
-			err,
+			a.safeTelegramError(err),
 		)
 	}
 }
 
-// Підтверджує callback без тексту, щоб Telegram закрив індикатор завантаження без спливного повідомлення.
-func (a *App) acknowledgeCallback(callbackID string) {
-	_, _ = a.bot.Request(tgbotapi.NewCallback(callbackID, ""))
+// Підтверджує callback без тексту після фіксації пов'язаної DB-транзакції.
+func (a *App) acknowledgeCallback(ctx context.Context, callbackID string) {
+	a.answerCallback(ctx, callbackID, "")
+}
+
+func (a *App) answerCallback(ctx context.Context, callbackID, text string) {
+	if collector := telegramReplyCollectorFromContext(ctx); collector != nil {
+		collector.addCallback(callbackID, text)
+		return
+	}
+
+	if _, err := a.bot.Request(tgbotapi.NewCallback(callbackID, text)); err != nil {
+		appmetrics.TelegramSendErrorsTotal.WithLabelValues("callback_answer").Inc()
+		slog.Error("failed to answer callback query", "callback_id", callbackID, "error", a.safeTelegramError(err))
+	}
 }
 
 // --- ФОНОВЕ ОПИТУВАННЯ BINANCE API ---

@@ -35,10 +35,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if updateWorkers > workers.TelegramUpdateShardCount {
+	if updateWorkers > workers.MaxTelegramUpdateWorkerCount {
 		return Config{}, fmt.Errorf(
 			"TELEGRAM_UPDATE_WORKERS must not exceed %d",
-			workers.TelegramUpdateShardCount,
+			workers.MaxTelegramUpdateWorkerCount,
 		)
 	}
 
