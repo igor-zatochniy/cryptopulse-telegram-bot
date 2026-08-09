@@ -238,15 +238,40 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 }
 
 func (a *App) processTelegramReply(ctx context.Context, job TelegramReplyJob) {
-	sendErr := a.sendTelegramReply(job)
+	telegramMessageID, sendErr := a.sendTelegramReply(job)
 	if sendErr == nil || (job.Operation == telegramReplyEditMessage && isTelegramMessageNotModified(sendErr)) {
-		if err := a.markTelegramReplySent(ctx, job); err != nil {
+		if telegramMessageID == 0 && job.Operation == telegramReplyEditMessage {
+			telegramMessageID = job.MessageID
+		}
+
+		finalizationAttempts, err := defaultSentFinalizationPolicy.finalize(
+			ctx,
+			"telegram_reply",
+			job.ID,
+			telegramMessageID,
+			func(finalCtx context.Context) error {
+				return a.markTelegramReplySentOnce(finalCtx, job)
+			},
+		)
+		if err != nil {
 			if errors.Is(err, errJobOwnershipLost) {
 				slog.Warn("ignored stale Telegram reply success", "reply_id", job.ID, "attempts", job.Attempts)
 				appmetrics.TelegramRepliesTotal.WithLabelValues("sent_stale_claim").Inc()
 				return
 			}
-			slog.Error("failed to persist Telegram reply success", "reply_id", job.ID, "error", err)
+			slog.Error(
+				"Telegram reply delivered but database finalization failed",
+				"reply_id",
+				job.ID,
+				"chat_id",
+				job.ChatID,
+				"telegram_message_id",
+				telegramMessageID,
+				"finalization_attempts",
+				finalizationAttempts,
+				"error",
+				err,
+			)
 			appmetrics.TelegramRepliesTotal.WithLabelValues("sent_persist_error").Inc()
 			return
 		}
@@ -286,12 +311,12 @@ func (a *App) processTelegramReply(ctx context.Context, job TelegramReplyJob) {
 	)
 }
 
-func (a *App) sendTelegramReply(job TelegramReplyJob) error {
+func (a *App) sendTelegramReply(job TelegramReplyJob) (int, error) {
 	var markup *tgbotapi.InlineKeyboardMarkup
 	if job.ReplyMarkup.Valid && job.ReplyMarkup.String != "" {
 		var decoded tgbotapi.InlineKeyboardMarkup
 		if err := json.Unmarshal([]byte(job.ReplyMarkup.String), &decoded); err != nil {
-			return fmt.Errorf("decode Telegram reply markup: %w", err)
+			return 0, fmt.Errorf("decode Telegram reply markup: %w", err)
 		}
 		markup = &decoded
 	}
@@ -303,18 +328,18 @@ func (a *App) sendTelegramReply(job TelegramReplyJob) error {
 		if markup != nil {
 			msg.ReplyMarkup = *markup
 		}
-		_, err := a.bot.Send(msg)
-		return err
+		sentMessage, err := a.bot.Send(msg)
+		return sentMessage.MessageID, err
 	case telegramReplyEditMessage:
 		edit := tgbotapi.NewEditMessageText(job.ChatID, job.MessageID, job.Text)
 		edit.ParseMode = "Markdown"
 		if markup != nil {
 			edit.ReplyMarkup = markup
 		}
-		_, err := a.bot.Send(edit)
-		return err
+		sentMessage, err := a.bot.Send(edit)
+		return sentMessage.MessageID, err
 	default:
-		return fmt.Errorf("unsupported Telegram reply operation %q", job.Operation)
+		return 0, fmt.Errorf("unsupported Telegram reply operation %q", job.Operation)
 	}
 }
 
@@ -345,12 +370,9 @@ func logTelegramReplyFinalizationError(operation string, job TelegramReplyJob, e
 	)
 }
 
-func (a *App) markTelegramReplySent(ctx context.Context, job TelegramReplyJob) error {
-	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
-	defer dbCancel()
-
+func (a *App) markTelegramReplySentOnce(ctx context.Context, job TelegramReplyJob) error {
 	result, err := a.db.ExecContext(
-		dbCtx,
+		ctx,
 		`UPDATE telegram_replies
 		 SET status = 'sent',
 		     sent_at = NOW(),

@@ -49,6 +49,15 @@ type fakeTelegramServer struct {
 
 func newFakeTelegramBot(t *testing.T, send func(chatID int64) fakeTelegramResponse) *tgbotapi.BotAPI {
 	t.Helper()
+	bot, _ := newFakeTelegramBotWithServer(t, send)
+	return bot
+}
+
+func newFakeTelegramBotWithServer(
+	t *testing.T,
+	send func(chatID int64) fakeTelegramResponse,
+) (*tgbotapi.BotAPI, *fakeTelegramServer) {
+	t.Helper()
 
 	fake := &fakeTelegramServer{send: send}
 	fake.server = httptest.NewServer(http.HandlerFunc(fake.handle))
@@ -63,7 +72,20 @@ func newFakeTelegramBot(t *testing.T, send func(chatID int64) fakeTelegramRespon
 		t.Fatalf("create fake telegram bot: %v", err)
 	}
 
-	return bot
+	return bot, fake
+}
+
+func (s *fakeTelegramServer) callCount(method string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := 0
+	for _, calledMethod := range s.calls {
+		if calledMethod == method {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *fakeTelegramServer) handle(w http.ResponseWriter, r *http.Request) {
@@ -276,6 +298,56 @@ func applyIntegrationMigrations(t *testing.T, ctx context.Context, db *sql.DB) {
 
 	if _, err := storage.ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("apply migrations: %v", err)
+	}
+}
+
+func installNotificationSentFinalizationFailures(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	if _, err := db.Exec(`CREATE SEQUENCE test_notification_sent_finalize_attempt_seq`); err != nil {
+		t.Fatalf("create notification finalization test sequence: %v", err)
+	}
+	if _, err := db.Exec(`CREATE FUNCTION test_fail_notification_sent_finalize() RETURNS trigger AS $$
+		BEGIN
+			IF nextval('test_notification_sent_finalize_attempt_seq') <= 2 THEN
+				RAISE EXCEPTION 'temporary notification finalization failure';
+			END IF;
+			RETURN NEW;
+		END;
+	$$ LANGUAGE plpgsql`); err != nil {
+		t.Fatalf("create notification finalization test function: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER test_fail_notification_sent_finalize_trigger
+		BEFORE UPDATE ON notification_jobs
+		FOR EACH ROW
+		WHEN (OLD.status = 'sending' AND NEW.status = 'sent')
+		EXECUTE FUNCTION test_fail_notification_sent_finalize()`); err != nil {
+		t.Fatalf("create notification finalization test trigger: %v", err)
+	}
+}
+
+func installTelegramReplySentFinalizationFailures(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	if _, err := db.Exec(`CREATE SEQUENCE test_telegram_reply_sent_finalize_attempt_seq`); err != nil {
+		t.Fatalf("create reply finalization test sequence: %v", err)
+	}
+	if _, err := db.Exec(`CREATE FUNCTION test_fail_telegram_reply_sent_finalize() RETURNS trigger AS $$
+		BEGIN
+			IF nextval('test_telegram_reply_sent_finalize_attempt_seq') <= 2 THEN
+				RAISE EXCEPTION 'temporary reply finalization failure';
+			END IF;
+			RETURN NEW;
+		END;
+	$$ LANGUAGE plpgsql`); err != nil {
+		t.Fatalf("create reply finalization test function: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER test_fail_telegram_reply_sent_finalize_trigger
+		BEFORE UPDATE ON telegram_replies
+		FOR EACH ROW
+		WHEN (OLD.status = 'sending' AND NEW.status = 'sent')
+		EXECUTE FUNCTION test_fail_telegram_reply_sent_finalize()`); err != nil {
+		t.Fatalf("create reply finalization test trigger: %v", err)
 	}
 }
 
@@ -932,6 +1004,109 @@ func TestIntegrationTelegramTokenIsRedactedBeforePersistingDeliveryError(t *test
 	}
 }
 
+func TestIntegrationNotificationFinalizationRetriesWithoutResending(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot, fakeTelegram := newFakeTelegramBotWithServer(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 316
+	insertSubscriber(t, db, chatID, true, 1, "ua", time.Now().Add(-2*time.Hour).UTC())
+
+	created, err := app.createCronNotificationJobs(context.Background())
+	if err != nil {
+		t.Fatalf("create notification job: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created jobs = %d, want 1", created)
+	}
+
+	job, err := app.claimPendingNotificationJob(context.Background())
+	if err != nil {
+		t.Fatalf("claim notification job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("notification job claim returned nil")
+	}
+
+	installNotificationSentFinalizationFailures(t, db)
+	app.processNotificationJob(context.Background(), *job)
+
+	if got := fakeTelegram.callCount("sendMessage"); got != 1 {
+		t.Fatalf("Telegram send calls = %d, want 1", got)
+	}
+
+	var status string
+	if err := db.QueryRow("SELECT status FROM notification_jobs WHERE id = $1", job.ID).Scan(&status); err != nil {
+		t.Fatalf("read notification job status: %v", err)
+	}
+	if status != "sent" {
+		t.Fatalf("notification job status = %q, want sent", status)
+	}
+
+	var finalizationAttempts int
+	if err := db.QueryRow("SELECT last_value FROM test_notification_sent_finalize_attempt_seq").Scan(&finalizationAttempts); err != nil {
+		t.Fatalf("read notification finalization attempts: %v", err)
+	}
+	if finalizationAttempts != 3 {
+		t.Fatalf("notification finalization attempts = %d, want 3", finalizationAttempts)
+	}
+}
+
+func TestIntegrationTelegramReplyFinalizationRetriesWithoutResending(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot, fakeTelegram := newFakeTelegramBotWithServer(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const (
+		sourceUpdateID int64 = 9101
+		chatID         int64 = 317
+	)
+	if _, err := db.Exec(
+		`INSERT INTO telegram_replies (
+			source_update_id,
+			sequence_no,
+			chat_id,
+			operation,
+			message_text
+		) VALUES ($1, 0, $2, 'send_message', 'reply')`,
+		sourceUpdateID,
+		chatID,
+	); err != nil {
+		t.Fatalf("insert Telegram reply: %v", err)
+	}
+
+	job, err := app.claimPendingTelegramReply(context.Background())
+	if err != nil {
+		t.Fatalf("claim Telegram reply: %v", err)
+	}
+	if job == nil {
+		t.Fatal("Telegram reply claim returned nil")
+	}
+
+	installTelegramReplySentFinalizationFailures(t, db)
+	app.processTelegramReply(context.Background(), *job)
+
+	if got := fakeTelegram.callCount("sendMessage"); got != 1 {
+		t.Fatalf("Telegram send calls = %d, want 1", got)
+	}
+
+	var status string
+	if err := db.QueryRow("SELECT status FROM telegram_replies WHERE id = $1", job.ID).Scan(&status); err != nil {
+		t.Fatalf("read Telegram reply status: %v", err)
+	}
+	if status != "sent" {
+		t.Fatalf("Telegram reply status = %q, want sent", status)
+	}
+
+	var finalizationAttempts int
+	if err := db.QueryRow("SELECT last_value FROM test_telegram_reply_sent_finalize_attempt_seq").Scan(&finalizationAttempts); err != nil {
+		t.Fatalf("read Telegram reply finalization attempts: %v", err)
+	}
+	if finalizationAttempts != 3 {
+		t.Fatalf("Telegram reply finalization attempts = %d, want 3", finalizationAttempts)
+	}
+}
+
 func TestIntegrationCronReturnsBeforeTelegramDeliveryCompletes(t *testing.T) {
 	db := setupIntegrationDB(t)
 	sendStarted := make(chan struct{})
@@ -1068,7 +1243,7 @@ func TestIntegrationStaleNotificationClaimCannotMarkSent(t *testing.T) {
 		t.Fatalf("simulate newer notification claim: %v", err)
 	}
 
-	err = app.markNotificationJobSent(context.Background(), *job)
+	err = app.markNotificationJobSentOnce(context.Background(), *job)
 	if !errors.Is(err, errJobOwnershipLost) {
 		t.Fatalf("mark stale notification job sent error = %v, want %v", err, errJobOwnershipLost)
 	}

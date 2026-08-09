@@ -290,9 +290,10 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - Для одного Telegram chat зберігається FIFO processing між replicas через SQL claim rule і PostgreSQL advisory lock.
 - Мова користувача читається з PostgreSQL під час обробки update, без локального per-replica cache.
 - Telegram sends виконуються поза database transactions.
+- Telegram delivery використовує at-least-once semantics. Після підтвердженого send DB-finalization повторюється до п'яти разів із bounded backoff без повторного Telegram request у межах тієї самої processing attempt. Рідкісний duplicate залишається можливим, якщо process завершується після прийняття message Telegram, але до durable збереження status `sent`.
 - Успішні sends оновлюють `last_sent`; невдалі sends не оновлюють.
 - `/unsubscribe` атомарно вимикає підписку та скасовує активний scheduled job; notification worker повторно перевіряє підписку під per-chat advisory lock.
-- Transient retry очищає subscriber claim, але pending outbox job не дозволяє створити duplicate notification.
+- Transient retry очищає subscriber claim, але pending outbox job не дозволяє створити другу active job для того самого chat.
 - Після вичерпання transient retry attempts підписник тимчасово призупиняється через `delivery_suspended_until`.
 - Outbox retention видаляє `sent` і `canceled` jobs після 30 днів, а `failed` jobs після 90 днів; `pending` і `sending` jobs не видаляються.
 - Inbox retention видаляє `processed` updates після 7 днів, а `failed` updates після 30 днів; `pending` і `processing` updates не видаляються.

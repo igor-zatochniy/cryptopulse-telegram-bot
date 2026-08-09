@@ -280,7 +280,8 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = apptelegram.RefreshKeyboard(job.Lang)
 
-	if _, err := a.bot.Send(msg); err != nil {
+	sentMessage, err := a.bot.Send(msg)
+	if err != nil {
 		errorType := "transient"
 		safeErr := a.safeTelegramError(err)
 		slog.Error("failed to send scheduled alert", "chat_id", job.ChatID, "error", safeErr)
@@ -318,14 +319,35 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 		return
 	}
 
-	if err := a.markNotificationJobSent(ctx, job); err != nil {
+	finalizationAttempts, err := defaultSentFinalizationPolicy.finalize(
+		ctx,
+		"notification",
+		job.ID,
+		sentMessage.MessageID,
+		func(finalCtx context.Context) error {
+			return a.markNotificationJobSentOnce(finalCtx, job)
+		},
+	)
+	if err != nil {
 		if errors.Is(err, errJobOwnershipLost) {
 			slog.Warn("ignored stale notification success result", "job_id", job.ID, "attempts", job.Attempts)
 			appmetrics.CronDeliveriesTotal.WithLabelValues("sent_stale_claim").Inc()
 			return
 		}
 
-		slog.Error("failed to persist successful notification delivery", "chat_id", job.ChatID, "error", err)
+		slog.Error(
+			"Telegram notification delivered but database finalization failed",
+			"job_id",
+			job.ID,
+			"chat_id",
+			job.ChatID,
+			"telegram_message_id",
+			sentMessage.MessageID,
+			"finalization_attempts",
+			finalizationAttempts,
+			"error",
+			err,
+		)
 		appmetrics.CronDeliveriesTotal.WithLabelValues("sent_persist_error").Inc()
 		return
 	}
@@ -356,11 +378,8 @@ func (a *App) deferNotificationJob(ctx context.Context, job NotificationJob, pro
 	appmetrics.CronDeliveriesTotal.WithLabelValues("retry").Inc()
 }
 
-func (a *App) markNotificationJobSent(ctx context.Context, job NotificationJob) error {
-	dbCtx, dbCancel := finalizationContext(ctx, 5*time.Second)
-	defer dbCancel()
-
-	tx, err := a.db.BeginTx(dbCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+func (a *App) markNotificationJobSentOnce(ctx context.Context, job NotificationJob) error {
+	tx, err := a.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_sent", "error").Inc()
 		return err
@@ -370,7 +389,7 @@ func (a *App) markNotificationJobSent(ctx context.Context, job NotificationJob) 
 	}()
 
 	result, err := tx.ExecContext(
-		dbCtx,
+		ctx,
 		`UPDATE notification_jobs
 		 SET status = 'sent',
 		     sent_at = NOW(),
@@ -395,7 +414,7 @@ func (a *App) markNotificationJobSent(ctx context.Context, job NotificationJob) 
 	}
 
 	if _, err := tx.ExecContext(
-		dbCtx,
+		ctx,
 		`UPDATE subscribers
 		 SET last_sent = date_trunc('minute', $2::timestamptz),
 		     cron_claimed_until = NULL,
