@@ -443,6 +443,32 @@ func TestIntegrationSubscribeAfterLanguageSelection(t *testing.T) {
 	assertClaimCleared(t, db, chatID)
 }
 
+func TestIntegrationResubscribePreservesIntervalWithoutPromisingDefault(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 103
+	insertSubscriber(t, db, chatID, false, 5, "en", time.Now().Add(-2*time.Hour).UTC())
+
+	collector := &telegramReplyCollector{}
+	ctx := withTelegramReplyCollector(context.Background(), collector)
+	if err := app.processTelegramUpdateWithDB(ctx, app.db, commandUpdate(chatID, "/subscribe")); err != nil {
+		t.Fatalf("process repeated subscription: %v", err)
+	}
+
+	assertSubscriberState(t, db, chatID, true, 5, "en")
+	if collector.err != nil {
+		t.Fatalf("collect subscription reply: %v", collector.err)
+	}
+	if len(collector.replies) != 1 {
+		t.Fatalf("subscription replies = %d, want 1", len(collector.replies))
+	}
+	if got := collector.replies[0].Text; got != apptelegram.Text("en", "subscribe") {
+		t.Fatalf("subscription reply = %q, want %q", got, apptelegram.Text("en", "subscribe"))
+	}
+}
+
 func TestIntegrationLanguageLookupReadsCurrentDatabaseAcrossReplicas(t *testing.T) {
 	db := setupIntegrationDB(t)
 	bot := newFakeTelegramBot(t, nil)

@@ -276,7 +276,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 		return
 	}
 
-	msg := tgbotapi.NewMessage(job.ChatID, job.Text)
+	msg := tgbotapi.NewMessage(job.ChatID, notificationMessageForDelivery(job, time.Now().UTC()))
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = apptelegram.RefreshKeyboard(job.Lang)
 
@@ -353,6 +353,14 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 	}
 
 	appmetrics.CronDeliveriesTotal.WithLabelValues("sent").Inc()
+}
+
+func notificationMessageForDelivery(job NotificationJob, deliveredAt time.Time) string {
+	if job.ScheduledAt.IsZero() || priceAge(deliveredAt, job.ScheduledAt) <= priceFreshnessLimit {
+		return job.Text
+	}
+
+	return fmt.Sprintf("%s\n\n%s", job.Text, apptelegram.Text(job.Lang, "delay_warning"))
 }
 
 func (a *App) deferNotificationJob(ctx context.Context, job NotificationJob, processingErr error) {

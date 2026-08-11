@@ -232,6 +232,28 @@ func TestFormattedPricesDoesNotMarkFreshDataAsStale(t *testing.T) {
 	}
 }
 
+func TestNotificationMessageForDeliveryMarksDelayedSnapshot(t *testing.T) {
+	scheduledAt := time.Date(2026, time.July, 28, 10, 30, 0, 0, time.UTC)
+	job := NotificationJob{
+		Lang:        "en",
+		Text:        "scheduled prices",
+		ScheduledAt: scheduledAt,
+	}
+
+	fresh := notificationMessageForDelivery(job, scheduledAt.Add(priceFreshnessLimit))
+	if fresh != job.Text {
+		t.Fatalf("fresh delivery message = %q, want unchanged snapshot", fresh)
+	}
+
+	delayed := notificationMessageForDelivery(job, scheduledAt.Add(priceFreshnessLimit+time.Second))
+	if !strings.Contains(delayed, job.Text) {
+		t.Fatalf("delayed delivery does not contain original snapshot: %q", delayed)
+	}
+	if !strings.Contains(delayed, "Delivery was delayed") {
+		t.Fatalf("delayed delivery does not contain warning: %q", delayed)
+	}
+}
+
 func TestInteractiveRepliesAreCollectedWithoutCallingTelegram(t *testing.T) {
 	collector := &telegramReplyCollector{}
 	ctx := withTelegramReplyCollector(context.Background(), collector)
