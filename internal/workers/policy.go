@@ -29,19 +29,24 @@ const (
 	TelegramReplySentRetention          = 7 * 24 * time.Hour
 	TelegramReplyFailedRetention        = 30 * 24 * time.Hour
 
-	// NotificationJobClaimWindow покриває 10s Telegram timeout і збереження результату в БД.
-	NotificationJobClaimWindow          = 45 * time.Second
-	NotificationJobPollInterval         = 2 * time.Second
-	NotificationJobMaxAttempts          = 3
-	NotificationFailureCooldown         = 15 * time.Minute
-	RetentionCleanupInterval            = time.Hour
-	NotificationSentRetention           = 30 * 24 * time.Hour
-	NotificationFailedRetention         = 90 * 24 * time.Hour
-	NotificationCanceledRetention       = 30 * 24 * time.Hour
-	RetentionCleanupLimit               = 1000
-	CronAdvisoryLockKey           int64 = 0x63726f6e6c6f636b
-	TelegramChatLockPrefix              = "cryptopulse:telegram-chat:"
-	GracefulShutdownTimeout             = 30 * time.Second
+	// NotificationJobClaimWindow покриває advisory lock, перевірки БД, Telegram timeout і фіналізацію.
+	NotificationJobClaimWindow                 = 45 * time.Second
+	NotificationSubscriptionCheckTimeout       = 5 * time.Second
+	NotificationClaimValidationTimeout         = 5 * time.Second
+	NotificationSendLeaseSafetyWindow          = 15 * time.Second
+	NotificationJobPollInterval                = 2 * time.Second
+	NotificationJobMaxAttempts                 = 3
+	NotificationFailureCooldown                = 15 * time.Minute
+	RetentionCleanupInterval                   = time.Hour
+	RetentionCleanupRunTimeout                 = 30 * time.Second
+	RetentionTableCleanupTimeout               = 10 * time.Second
+	NotificationSentRetention                  = 30 * 24 * time.Hour
+	NotificationFailedRetention                = 90 * 24 * time.Hour
+	NotificationCanceledRetention              = 30 * 24 * time.Hour
+	RetentionCleanupLimit                      = 1000
+	CronAdvisoryLockKey                  int64 = 0x63726f6e6c6f636b
+	TelegramChatLockPrefix                     = "cryptopulse:telegram-chat:"
+	GracefulShutdownTimeout                    = 30 * time.Second
 )
 
 // PostgresInterval перетворює duration на безпечний interval-параметр PostgreSQL.

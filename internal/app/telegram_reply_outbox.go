@@ -292,7 +292,7 @@ func (a *App) processTelegramReply(ctx context.Context, job TelegramReplyJob) {
 		if err := a.markTelegramReplyFailed(ctx, job, safeErr); err != nil {
 			logTelegramReplyFinalizationError("failure", job, err)
 		}
-	} else if err := a.markTelegramReplyRetry(ctx, job, safeErr); err != nil {
+	} else if err := a.markTelegramReplyRetry(ctx, job, sendErr); err != nil {
 		logTelegramReplyFinalizationError("retry", job, err)
 	}
 
@@ -419,7 +419,7 @@ func (a *App) markTelegramReplyRetry(ctx context.Context, job TelegramReplyJob, 
 		 AND claim_token = $4::uuid
 		 AND attempts = $5`,
 		job.ID,
-		workers.PostgresInterval(workers.RetryDelay(job.Attempts)),
+		workers.PostgresInterval(telegramRetryDelay(job.Attempts, sendErr)),
 		workers.TruncateError(safeErr.Error(), 500),
 		job.ClaimToken,
 		job.Attempts,

@@ -259,7 +259,12 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 	}
 	defer releaseTelegramChatAdvisoryLock(ctx, lockConn, lockKey)
 
-	subscribed, err := a.isSubscribed(ctx, job.ChatID)
+	subscriptionCtx, subscriptionCancel := context.WithTimeout(
+		ctx,
+		workers.NotificationSubscriptionCheckTimeout,
+	)
+	subscribed, err := a.isSubscribed(subscriptionCtx, job.ChatID)
+	subscriptionCancel()
 	if err != nil {
 		a.deferNotificationJob(ctx, job, fmt.Errorf("check subscription before delivery: %w", err))
 		return
@@ -273,6 +278,19 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 			}
 		}
 		appmetrics.CronDeliveriesTotal.WithLabelValues("canceled").Inc()
+		return
+	}
+
+	claimCtx, claimCancel := context.WithTimeout(ctx, workers.NotificationClaimValidationTimeout)
+	err = a.ensureNotificationJobClaimCurrent(claimCtx, job)
+	claimCancel()
+	if err != nil {
+		if errors.Is(err, errJobOwnershipLost) {
+			slog.Warn("skipped notification send for stale claim", "job_id", job.ID, "attempts", job.Attempts)
+			appmetrics.CronDeliveriesTotal.WithLabelValues("skipped_stale_claim").Inc()
+			return
+		}
+		a.deferNotificationJob(ctx, job, fmt.Errorf("validate notification claim before delivery: %w", err))
 		return
 	}
 
@@ -305,7 +323,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 				}
 			}
 		} else {
-			if markErr := a.markNotificationJobRetry(ctx, job, safeErr); markErr != nil {
+			if markErr := a.markNotificationJobRetry(ctx, job, err); markErr != nil {
 				if errors.Is(markErr, errJobOwnershipLost) {
 					slog.Warn("ignored stale notification retry result", "job_id", job.ID, "attempts", job.Attempts)
 				} else {
@@ -361,6 +379,37 @@ func notificationMessageForDelivery(job NotificationJob, deliveredAt time.Time) 
 	}
 
 	return fmt.Sprintf("%s\n\n%s", job.Text, apptelegram.Text(job.Lang, "delay_warning"))
+}
+
+func (a *App) ensureNotificationJobClaimCurrent(ctx context.Context, job NotificationJob) error {
+	var current bool
+	err := a.db.QueryRowContext(
+		ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			FROM notification_jobs
+			WHERE id = $1
+			AND status = 'sending'
+			AND claim_token = $2::uuid
+			AND attempts = $3
+			AND claimed_until > NOW() + $4::interval
+		)`,
+		job.ID,
+		job.ClaimToken,
+		job.Attempts,
+		workers.PostgresInterval(workers.NotificationSendLeaseSafetyWindow),
+	).Scan(&current)
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("validate_notification_claim", "error").Inc()
+		return err
+	}
+	if !current {
+		appmetrics.DBOperationsTotal.WithLabelValues("validate_notification_claim", "stale_claim").Inc()
+		return errJobOwnershipLost
+	}
+
+	appmetrics.DBOperationsTotal.WithLabelValues("validate_notification_claim", "success").Inc()
+	return nil
 }
 
 func (a *App) deferNotificationJob(ctx context.Context, job NotificationJob, processingErr error) {
@@ -458,7 +507,7 @@ func (a *App) markNotificationJobRetry(ctx context.Context, job NotificationJob,
 		_ = tx.Rollback()
 	}()
 
-	delay := workers.RetryDelay(job.Attempts)
+	delay := telegramRetryDelay(job.Attempts, sendErr)
 	result, err := tx.ExecContext(
 		dbCtx,
 		`UPDATE notification_jobs

@@ -1231,7 +1231,11 @@ func TestIntegrationCronRecordsClaimMinuteAsLastSent(t *testing.T) {
 
 func TestIntegrationStaleNotificationClaimCannotMarkSent(t *testing.T) {
 	db := setupIntegrationDB(t)
-	bot := newFakeTelegramBot(t, nil)
+	var sendCalls int
+	bot := newFakeTelegramBot(t, func(_ int64) fakeTelegramResponse {
+		sendCalls++
+		return fakeTelegramResponse{OK: true}
+	})
 	app := newIntegrationApp(t, db, bot)
 
 	const chatID int64 = 305
@@ -1269,6 +1273,11 @@ func TestIntegrationStaleNotificationClaimCannotMarkSent(t *testing.T) {
 		t.Fatalf("simulate newer notification claim: %v", err)
 	}
 
+	app.processNotificationJob(context.Background(), *job)
+	if sendCalls != 0 {
+		t.Fatalf("Telegram send calls from stale worker = %d, want 0", sendCalls)
+	}
+
 	err = app.markNotificationJobSentOnce(context.Background(), *job)
 	if !errors.Is(err, errJobOwnershipLost) {
 		t.Fatalf("mark stale notification job sent error = %v, want %v", err, errJobOwnershipLost)
@@ -1283,6 +1292,134 @@ func TestIntegrationStaleNotificationClaimCannotMarkSent(t *testing.T) {
 	}
 	assertLastSentUnchanged(t, db, chatID, oldLastSent)
 	assertClaimActive(t, db, chatID)
+}
+
+func TestIntegrationNotificationSubscriptionCheckTimesOutBeforeLease(t *testing.T) {
+	db := setupIntegrationDB(t)
+	var sendCalls int
+	bot := newFakeTelegramBot(t, func(_ int64) fakeTelegramResponse {
+		sendCalls++
+		return fakeTelegramResponse{OK: true}
+	})
+	app := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 318
+	insertSubscriber(t, db, chatID, true, 1, "ua", time.Now().Add(-2*time.Hour).UTC())
+	created, err := app.createCronNotificationJobs(context.Background())
+	if err != nil {
+		t.Fatalf("create notification job: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created jobs = %d, want 1", created)
+	}
+
+	job, err := app.claimPendingNotificationJob(context.Background())
+	if err != nil {
+		t.Fatalf("claim notification job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("notification job claim returned nil")
+	}
+
+	lockTx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin subscribers table lock: %v", err)
+	}
+	defer func() {
+		_ = lockTx.Rollback()
+	}()
+	if _, err := lockTx.Exec("LOCK TABLE subscribers IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatalf("lock subscribers table: %v", err)
+	}
+
+	startedAt := time.Now()
+	done := make(chan struct{})
+	go func() {
+		app.processNotificationJob(context.Background(), *job)
+		close(done)
+	}()
+
+	time.Sleep(workers.NotificationSubscriptionCheckTimeout + 500*time.Millisecond)
+	if err := lockTx.Rollback(); err != nil {
+		t.Fatalf("release subscribers table lock: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("notification worker did not return after subscription timeout")
+	}
+	if elapsed := time.Since(startedAt); elapsed >= workers.NotificationJobClaimWindow {
+		t.Fatalf("notification worker elapsed = %s, want below lease %s", elapsed, workers.NotificationJobClaimWindow)
+	}
+	if sendCalls != 0 {
+		t.Fatalf("Telegram send calls after subscription timeout = %d, want 0", sendCalls)
+	}
+
+	state := waitForNotificationJobStatus(t, db, chatID, "pending")
+	if state.Attempts != 1 {
+		t.Fatalf("notification attempts = %d, want 1", state.Attempts)
+	}
+}
+
+func TestIntegrationTelegramRetryAfterControlsOutboxBackoff(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	retryErr := &tgbotapi.Error{
+		Code:    http.StatusTooManyRequests,
+		Message: "Too Many Requests: retry later",
+		ResponseParameters: tgbotapi.ResponseParameters{
+			RetryAfter: 300,
+		},
+	}
+
+	const notificationChatID int64 = 319
+	insertSubscriber(t, db, notificationChatID, true, 1, "ua", time.Now().Add(-2*time.Hour).UTC())
+	created, err := app.createCronNotificationJobs(context.Background())
+	if err != nil {
+		t.Fatalf("create notification job: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created notification jobs = %d, want 1", created)
+	}
+	notificationJob, err := app.claimPendingNotificationJob(context.Background())
+	if err != nil {
+		t.Fatalf("claim notification job: %v", err)
+	}
+	if notificationJob == nil {
+		t.Fatal("notification job claim returned nil")
+	}
+	notificationRetryStarted := time.Now().UTC()
+	if err := app.markNotificationJobRetry(context.Background(), *notificationJob, retryErr); err != nil {
+		t.Fatalf("mark notification retry: %v", err)
+	}
+	notificationState := waitForNotificationJobStatus(t, db, notificationChatID, "pending")
+	assertRetryAfterDelay(t, notificationState.NextAttemptAt, notificationRetryStarted, 5*time.Minute)
+
+	const replySourceUpdateID int64 = 320
+	insertTelegramReplyForRetention(t, db, replySourceUpdateID, "pending", time.Now().UTC())
+	replyJob, err := app.claimPendingTelegramReply(context.Background())
+	if err != nil {
+		t.Fatalf("claim Telegram reply: %v", err)
+	}
+	if replyJob == nil {
+		t.Fatal("Telegram reply claim returned nil")
+	}
+	replyRetryStarted := time.Now().UTC()
+	if err := app.markTelegramReplyRetry(context.Background(), *replyJob, retryErr); err != nil {
+		t.Fatalf("mark Telegram reply retry: %v", err)
+	}
+
+	var replyNextAttemptAt time.Time
+	if err := db.QueryRow(
+		"SELECT next_attempt_at FROM telegram_replies WHERE id = $1",
+		replyJob.ID,
+	).Scan(&replyNextAttemptAt); err != nil {
+		t.Fatalf("select Telegram reply retry time: %v", err)
+	}
+	assertRetryAfterDelay(t, replyNextAttemptAt, replyRetryStarted, 5*time.Minute)
 }
 
 func TestIntegrationExhaustedTransientFailureSuspendsSubscriber(t *testing.T) {
@@ -1537,6 +1674,63 @@ func TestIntegrationTelegramReplyRetentionCleanup(t *testing.T) {
 	assertTelegramReplyCount(t, db, 904, 1)
 	assertTelegramReplyCount(t, db, 905, 1)
 	assertTelegramReplyCount(t, db, 906, 1)
+}
+
+func TestIntegrationRetentionCleanupDrainsBacklog(t *testing.T) {
+	db := setupIntegrationDB(t)
+	bot := newFakeTelegramBot(t, nil)
+	app := newIntegrationApp(t, db, bot)
+
+	const backlogSize = workers.RetentionCleanupLimit*2 + 500
+	if _, err := db.Exec(
+		`INSERT INTO notification_jobs (
+			chat_id, language_code, message_text, scheduled_at, status,
+			attempts, next_attempt_at, sent_at
+		)
+		SELECT 1000000 + value, 'ua', 'expired notification', NOW() - INTERVAL '100 days',
+		       'sent', 1, NOW(), NOW() - INTERVAL '100 days'
+		FROM generate_series(1, $1) AS value`,
+		backlogSize,
+	); err != nil {
+		t.Fatalf("insert notification retention backlog: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO telegram_updates (
+			update_id, chat_id, shard_id, payload, status, attempts,
+			next_attempt_at, processed_at
+		)
+		SELECT 2000000 + value, 2000000 + value, 0, '{}'::jsonb, 'processed', 1,
+		       NOW(), NOW() - INTERVAL '100 days'
+		FROM generate_series(1, $1) AS value`,
+		backlogSize,
+	); err != nil {
+		t.Fatalf("insert Telegram update retention backlog: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO telegram_replies (
+			source_update_id, sequence_no, chat_id, operation, message_id,
+			message_text, status, attempts, next_attempt_at, sent_at
+		)
+		SELECT 3000000 + value, 0, 3000000 + value, 'send_message', 0,
+		       'expired reply', 'sent', 1, NOW(), NOW() - INTERVAL '100 days'
+		FROM generate_series(1, $1) AS value`,
+		backlogSize,
+	); err != nil {
+		t.Fatalf("insert Telegram reply retention backlog: %v", err)
+	}
+
+	insertNotificationJobForRetention(t, db, 4000001, "pending", time.Now().Add(-100*24*time.Hour), sql.NullTime{})
+	insertTelegramUpdateForRetention(t, db, 4000002, "pending", time.Now().Add(-100*24*time.Hour), sql.NullTime{})
+	insertTelegramReplyForRetention(t, db, 4000003, "pending", time.Now().Add(-100*24*time.Hour))
+
+	app.runNotificationRetentionCleanup(context.Background())
+
+	assertTableStatusCount(t, db, "notification_jobs", "sent", 0)
+	assertTableStatusCount(t, db, "telegram_updates", "processed", 0)
+	assertTableStatusCount(t, db, "telegram_replies", "sent", 0)
+	assertNotificationJobCount(t, db, 4000001, 1)
+	assertTelegramUpdateStatus(t, db, 4000002, "pending")
+	assertTelegramReplyCount(t, db, 4000003, 1)
 }
 
 func TestIntegrationCronUsesPostgresAdvisoryLock(t *testing.T) {
@@ -2050,6 +2244,48 @@ func selectLastSent(t *testing.T, db *sql.DB, chatID int64) time.Time {
 		t.Fatalf("select last_sent %d: %v", chatID, err)
 	}
 	return lastSent
+}
+
+func assertRetryAfterDelay(
+	t *testing.T,
+	nextAttemptAt time.Time,
+	retryStartedAt time.Time,
+	want time.Duration,
+) {
+	t.Helper()
+
+	minimum := retryStartedAt.Add(want - time.Second)
+	maximum := retryStartedAt.Add(want + 10*time.Second)
+	if nextAttemptAt.Before(minimum) || nextAttemptAt.After(maximum) {
+		t.Fatalf(
+			"next attempt at %s, want between %s and %s",
+			nextAttemptAt,
+			minimum,
+			maximum,
+		)
+	}
+}
+
+func assertTableStatusCount(t *testing.T, db *sql.DB, table, status string, want int) {
+	t.Helper()
+
+	allowedTables := map[string]bool{
+		"notification_jobs": true,
+		"telegram_updates":  true,
+		"telegram_replies":  true,
+	}
+	if !allowedTables[table] {
+		t.Fatalf("unsupported table %q", table)
+	}
+
+	var count int
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = $1", table)
+	if err := db.QueryRow(query, status).Scan(&count); err != nil {
+		t.Fatalf("count %s rows with status %s: %v", table, status, err)
+	}
+	if count != want {
+		t.Fatalf("%s rows with status %s = %d, want %d", table, status, count, want)
+	}
 }
 
 type notificationJobState struct {

@@ -28,22 +28,22 @@ func (a *App) startNotificationRetentionCleaner(ctx context.Context) {
 }
 
 func (a *App) runNotificationRetentionCleanup(ctx context.Context) {
-	deletedJobs, err := a.cleanupNotificationJobHistory(ctx)
+	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, workers.RetentionCleanupRunTimeout)
+	defer cleanupCancel()
+
+	deletedJobs, err := a.cleanupNotificationJobHistory(cleanupCtx)
 	if err != nil {
-		slog.Error("failed to clean notification job history", "error", err)
-		return
+		slog.Error("failed to clean notification job history", "deleted", deletedJobs, "error", err)
 	}
 
-	deletedUpdates, err := a.cleanupTelegramUpdateHistory(ctx)
+	deletedUpdates, err := a.cleanupTelegramUpdateHistory(cleanupCtx)
 	if err != nil {
-		slog.Error("failed to clean telegram update inbox history", "error", err)
-		return
+		slog.Error("failed to clean telegram update inbox history", "deleted", deletedUpdates, "error", err)
 	}
 
-	deletedReplies, err := a.cleanupTelegramReplyHistory(ctx)
+	deletedReplies, err := a.cleanupTelegramReplyHistory(cleanupCtx)
 	if err != nil {
-		slog.Error("failed to clean Telegram reply outbox history", "error", err)
-		return
+		slog.Error("failed to clean Telegram reply outbox history", "deleted", deletedReplies, "error", err)
 	}
 
 	if deletedJobs > 0 || deletedUpdates > 0 || deletedReplies > 0 {
@@ -60,12 +60,10 @@ func (a *App) runNotificationRetentionCleanup(ctx context.Context) {
 }
 
 func (a *App) cleanupNotificationJobHistory(ctx context.Context) (int64, error) {
-	dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer dbCancel()
-
-	result, err := a.db.ExecContext(
-		dbCtx,
-		`WITH expired_jobs AS (
+	return drainRetentionBatches(ctx, "notification_retention_cleanup", func(dbCtx context.Context) (int64, error) {
+		result, err := a.db.ExecContext(
+			dbCtx,
+			`WITH expired_jobs AS (
 			SELECT id
 			FROM notification_jobs
 			WHERE (
@@ -87,33 +85,23 @@ func (a *App) cleanupNotificationJobHistory(ctx context.Context) (int64, error) 
 		DELETE FROM notification_jobs AS nj
 		USING expired_jobs
 		WHERE nj.id = expired_jobs.id`,
-		workers.PostgresInterval(workers.NotificationSentRetention),
-		workers.PostgresInterval(workers.NotificationFailedRetention),
-		workers.PostgresInterval(workers.NotificationCanceledRetention),
-		workers.RetentionCleanupLimit,
-	)
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("notification_retention_cleanup", "error").Inc()
-		return 0, err
-	}
-
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("notification_retention_cleanup", "error").Inc()
-		return 0, err
-	}
-
-	appmetrics.DBOperationsTotal.WithLabelValues("notification_retention_cleanup", "success").Inc()
-	return deleted, nil
+			workers.PostgresInterval(workers.NotificationSentRetention),
+			workers.PostgresInterval(workers.NotificationFailedRetention),
+			workers.PostgresInterval(workers.NotificationCanceledRetention),
+			workers.RetentionCleanupLimit,
+		)
+		if err != nil {
+			return 0, err
+		}
+		return result.RowsAffected()
+	})
 }
 
 func (a *App) cleanupTelegramUpdateHistory(ctx context.Context) (int64, error) {
-	dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer dbCancel()
-
-	result, err := a.db.ExecContext(
-		dbCtx,
-		`WITH expired_updates AS (
+	return drainRetentionBatches(ctx, "telegram_update_retention_cleanup", func(dbCtx context.Context) (int64, error) {
+		result, err := a.db.ExecContext(
+			dbCtx,
+			`WITH expired_updates AS (
 			SELECT update_id
 			FROM telegram_updates
 			WHERE (
@@ -131,32 +119,22 @@ func (a *App) cleanupTelegramUpdateHistory(ctx context.Context) (int64, error) {
 		DELETE FROM telegram_updates AS tu
 		USING expired_updates
 		WHERE tu.update_id = expired_updates.update_id`,
-		workers.PostgresInterval(workers.TelegramUpdateProcessedRetention),
-		workers.PostgresInterval(workers.TelegramUpdateFailedRetention),
-		workers.RetentionCleanupLimit,
-	)
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("telegram_update_retention_cleanup", "error").Inc()
-		return 0, err
-	}
-
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("telegram_update_retention_cleanup", "error").Inc()
-		return 0, err
-	}
-
-	appmetrics.DBOperationsTotal.WithLabelValues("telegram_update_retention_cleanup", "success").Inc()
-	return deleted, nil
+			workers.PostgresInterval(workers.TelegramUpdateProcessedRetention),
+			workers.PostgresInterval(workers.TelegramUpdateFailedRetention),
+			workers.RetentionCleanupLimit,
+		)
+		if err != nil {
+			return 0, err
+		}
+		return result.RowsAffected()
+	})
 }
 
 func (a *App) cleanupTelegramReplyHistory(ctx context.Context) (int64, error) {
-	dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer dbCancel()
-
-	result, err := a.db.ExecContext(
-		dbCtx,
-		`WITH expired_replies AS (
+	return drainRetentionBatches(ctx, "telegram_reply_retention_cleanup", func(dbCtx context.Context) (int64, error) {
+		result, err := a.db.ExecContext(
+			dbCtx,
+			`WITH expired_replies AS (
 			SELECT id
 			FROM telegram_replies
 			WHERE (
@@ -174,21 +152,37 @@ func (a *App) cleanupTelegramReplyHistory(ctx context.Context) (int64, error) {
 		DELETE FROM telegram_replies AS tr
 		USING expired_replies
 		WHERE tr.id = expired_replies.id`,
-		workers.PostgresInterval(workers.TelegramReplySentRetention),
-		workers.PostgresInterval(workers.TelegramReplyFailedRetention),
-		workers.RetentionCleanupLimit,
-	)
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("telegram_reply_retention_cleanup", "error").Inc()
-		return 0, err
-	}
+			workers.PostgresInterval(workers.TelegramReplySentRetention),
+			workers.PostgresInterval(workers.TelegramReplyFailedRetention),
+			workers.RetentionCleanupLimit,
+		)
+		if err != nil {
+			return 0, err
+		}
+		return result.RowsAffected()
+	})
+}
 
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("telegram_reply_retention_cleanup", "error").Inc()
-		return 0, err
-	}
+func drainRetentionBatches(
+	ctx context.Context,
+	operation string,
+	deleteBatch func(context.Context) (int64, error),
+) (int64, error) {
+	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, workers.RetentionTableCleanupTimeout)
+	defer cleanupCancel()
 
-	appmetrics.DBOperationsTotal.WithLabelValues("telegram_reply_retention_cleanup", "success").Inc()
-	return deleted, nil
+	var totalDeleted int64
+	for {
+		deleted, err := deleteBatch(cleanupCtx)
+		if err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues(operation, "error").Inc()
+			return totalDeleted, err
+		}
+
+		totalDeleted += deleted
+		if deleted < int64(workers.RetentionCleanupLimit) {
+			appmetrics.DBOperationsTotal.WithLabelValues(operation, "success").Inc()
+			return totalDeleted, nil
+		}
+	}
 }

@@ -4,6 +4,11 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/workers"
 )
 
 const redactedTelegramToken = "[REDACTED]"
@@ -27,4 +32,18 @@ func (a *App) safeTelegramError(err error) error {
 		return err
 	}
 	return redactTelegramError(err, a.bot.Token)
+}
+
+func telegramRetryDelay(attempts int, sendErr error) time.Duration {
+	delay := workers.RetryDelay(attempts)
+
+	var telegramErr *tgbotapi.Error
+	if errors.As(sendErr, &telegramErr) && telegramErr.RetryAfter > 0 {
+		requestedDelay := time.Duration(telegramErr.RetryAfter) * time.Second
+		if requestedDelay > delay {
+			return requestedDelay
+		}
+	}
+
+	return delay
 }
