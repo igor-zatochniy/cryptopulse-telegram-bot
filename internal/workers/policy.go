@@ -9,11 +9,13 @@ import (
 const (
 	DatabaseQueryPoolMaxOpenConnections = 16
 	DatabaseQueryPoolMaxIdleConnections = 8
-	DatabaseLockPoolMaxOpenConnections  = 8
+	DatabaseLockPoolMaxOpenConnections  = 12
 	DatabaseLockPoolMaxIdleConnections  = 2
 	NotificationWorkerCount             = 3
+	TelegramReplyWorkerCount            = 3
 	CronLockConnectionReserve           = 1
-	MaxTelegramUpdateWorkerCount        = DatabaseLockPoolMaxOpenConnections - NotificationWorkerCount - CronLockConnectionReserve
+	LockPoolOperationalReserve          = 1
+	MaxTelegramUpdateWorkerCount        = DatabaseLockPoolMaxOpenConnections - NotificationWorkerCount - TelegramReplyWorkerCount - CronLockConnectionReserve - LockPoolOperationalReserve
 	CronBatchLimit                      = 100
 	TelegramUpdateShardCount            = 64
 	DefaultTelegramUpdateWorkerCount    = MaxTelegramUpdateWorkerCount
@@ -22,9 +24,9 @@ const (
 	TelegramUpdateMaxAttempts           = 3
 	TelegramUpdateProcessedRetention    = 7 * 24 * time.Hour
 	TelegramUpdateFailedRetention       = 30 * 24 * time.Hour
-	TelegramReplyWorkerCount            = 3
 	TelegramReplyPollInterval           = 2 * time.Second
 	TelegramReplyClaimWindow            = 45 * time.Second
+	TelegramReplyClaimValidationTimeout = 5 * time.Second
 	TelegramReplyMaxAttempts            = 3
 	TelegramReplySentRetention          = 7 * 24 * time.Hour
 	TelegramReplyFailedRetention        = 30 * 24 * time.Hour
@@ -33,7 +35,8 @@ const (
 	NotificationJobClaimWindow                 = 45 * time.Second
 	NotificationSubscriptionCheckTimeout       = 5 * time.Second
 	NotificationClaimValidationTimeout         = 5 * time.Second
-	NotificationSendLeaseSafetyWindow          = 15 * time.Second
+	TelegramSendLeaseSafetyWindow              = 15 * time.Second
+	TelegramChatLockTimeout                    = 10 * time.Second
 	NotificationJobPollInterval                = 2 * time.Second
 	NotificationJobMaxAttempts                 = 3
 	NotificationFailureCooldown                = 15 * time.Minute

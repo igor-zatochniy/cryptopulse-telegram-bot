@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,42 @@ import (
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/httpserver"
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/workers"
 )
+
+func TestParseMarketPriceRejectsInvalidDomainValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    float64
+		wantErr bool
+	}{
+		{name: "valid", raw: "62500.25", want: 62500.25},
+		{name: "nan", raw: "NaN", wantErr: true},
+		{name: "positive infinity", raw: "+Inf", wantErr: true},
+		{name: "negative infinity", raw: "-Inf", wantErr: true},
+		{name: "zero", raw: "0", wantErr: true},
+		{name: "negative", raw: "-1", wantErr: true},
+		{name: "empty", raw: "", wantErr: true},
+		{name: "malformed", raw: "abc", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseMarketPrice(test.raw)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("parseMarketPrice(%q) = %v, want error", test.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseMarketPrice(%q): %v", test.raw, err)
+			}
+			if math.Abs(got-test.want) > 0.000001 {
+				t.Fatalf("parseMarketPrice(%q) = %v, want %v", test.raw, got, test.want)
+			}
+		})
+	}
+}
 
 func TestMetricsAuthMiddleware(t *testing.T) {
 	application := &App{metricsSecret: "test-secret"}

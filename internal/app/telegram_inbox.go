@@ -239,6 +239,16 @@ func telegramChatAdvisoryLockKey(chatID int64) int64 {
 	return int64(h.Sum64())
 }
 
+func tryTelegramChatTransactionLock(ctx context.Context, tx *sql.Tx, chatID int64) (bool, error) {
+	var acquired bool
+	err := tx.QueryRowContext(
+		ctx,
+		`SELECT pg_try_advisory_xact_lock($1)`,
+		telegramChatAdvisoryLockKey(chatID),
+	).Scan(&acquired)
+	return acquired, err
+}
+
 func (a *App) acquireTelegramChatAdvisoryLock(ctx context.Context, chatID int64) (*sql.Conn, int64, error) {
 	conn, err := a.lockDatabase().Conn(ctx)
 	if err != nil {

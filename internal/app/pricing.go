@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -89,7 +90,7 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 				return
 			}
 
-			price, err := strconv.ParseFloat(data.Price, 64)
+			price, err := parseMarketPrice(data.Price)
 			if err != nil {
 				appmetrics.BinanceRequestsTotal.WithLabelValues(c.Symbol, "parse_error").Inc()
 				slog.Error(
@@ -135,6 +136,17 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 	}
 	wg.Wait()
 	a.observePriceAges(time.Now().UTC())
+}
+
+func parseMarketPrice(raw string) (float64, error) {
+	price, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(price) || math.IsInf(price, 0) || price <= 0 {
+		return 0, fmt.Errorf("price must be finite and greater than zero")
+	}
+	return price, nil
 }
 
 func (a *App) getFormattedPricesFromCache(lang string) string {

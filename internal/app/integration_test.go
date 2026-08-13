@@ -720,6 +720,60 @@ func TestIntegrationTelegramReplyRetriesWithoutRepeatingCommand(t *testing.T) {
 	}
 }
 
+func TestIntegrationTelegramReplyReclaimWaitsForActiveSend(t *testing.T) {
+	db := setupIntegrationDB(t)
+	sendStarted := make(chan struct{})
+	releaseSend := make(chan struct{})
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSend) }) }
+	t.Cleanup(release)
+	bot := newFakeTelegramBot(t, func(_ int64) fakeTelegramResponse {
+		startOnce.Do(func() { close(sendStarted) })
+		<-releaseSend
+		return fakeTelegramResponse{OK: true}
+	})
+	appA := newIntegrationApp(t, db, bot)
+	appB := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 321
+	insertTelegramReplyForRetention(t, db, chatID, "pending", time.Now().UTC())
+	job, err := appA.claimPendingTelegramReply(context.Background())
+	if err != nil {
+		t.Fatalf("claim Telegram reply: %v", err)
+	}
+	if job == nil {
+		t.Fatal("Telegram reply claim returned nil")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		appA.processTelegramReply(context.Background(), *job)
+	}()
+
+	waitForSignal(t, sendStarted, "Telegram reply send to start")
+	if _, err := db.Exec(
+		"UPDATE telegram_replies SET claimed_until = NOW() - INTERVAL '1 second' WHERE id = $1",
+		job.ID,
+	); err != nil {
+		t.Fatalf("expire Telegram reply lease: %v", err)
+	}
+
+	reclaimed, err := appB.claimPendingTelegramReply(context.Background())
+	if err != nil {
+		t.Fatalf("attempt Telegram reply reclaim: %v", err)
+	}
+	if reclaimed != nil {
+		t.Fatalf("reclaimed Telegram reply while active sender held chat lock: %+v", reclaimed)
+	}
+	assertOutboxClaimUnchanged(t, db, "telegram_replies", job.ID, job.ClaimToken, job.Attempts)
+
+	release()
+	waitForSignal(t, done, "Telegram reply processing to finish")
+	assertTelegramReplyState(t, db, chatID, "sent", job.Attempts)
+}
+
 func TestIntegrationReducedWorkerCountClaimsLegacyShard(t *testing.T) {
 	db := setupIntegrationDB(t)
 	bot := newFakeTelegramBot(t, nil)
@@ -1294,6 +1348,67 @@ func TestIntegrationStaleNotificationClaimCannotMarkSent(t *testing.T) {
 	assertClaimActive(t, db, chatID)
 }
 
+func TestIntegrationNotificationReclaimWaitsForActiveSend(t *testing.T) {
+	db := setupIntegrationDB(t)
+	sendStarted := make(chan struct{})
+	releaseSend := make(chan struct{})
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSend) }) }
+	t.Cleanup(release)
+	bot := newFakeTelegramBot(t, func(_ int64) fakeTelegramResponse {
+		startOnce.Do(func() { close(sendStarted) })
+		<-releaseSend
+		return fakeTelegramResponse{OK: true}
+	})
+	appA := newIntegrationApp(t, db, bot)
+	appB := newIntegrationApp(t, db, bot)
+
+	const chatID int64 = 322
+	insertSubscriber(t, db, chatID, true, 1, "ua", time.Now().Add(-2*time.Hour).UTC())
+	created, err := appA.createCronNotificationJobs(context.Background())
+	if err != nil {
+		t.Fatalf("create notification job: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created notification jobs = %d, want 1", created)
+	}
+	job, err := appA.claimPendingNotificationJob(context.Background())
+	if err != nil {
+		t.Fatalf("claim notification job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("notification job claim returned nil")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		appA.processNotificationJob(context.Background(), *job)
+	}()
+
+	waitForSignal(t, sendStarted, "notification send to start")
+	if _, err := db.Exec(
+		"UPDATE notification_jobs SET claimed_until = NOW() - INTERVAL '1 second' WHERE id = $1",
+		job.ID,
+	); err != nil {
+		t.Fatalf("expire notification lease: %v", err)
+	}
+
+	reclaimed, err := appB.claimPendingNotificationJob(context.Background())
+	if err != nil {
+		t.Fatalf("attempt notification reclaim: %v", err)
+	}
+	if reclaimed != nil {
+		t.Fatalf("reclaimed notification while active sender held chat lock: %+v", reclaimed)
+	}
+	assertOutboxClaimUnchanged(t, db, "notification_jobs", job.ID, job.ClaimToken, job.Attempts)
+
+	release()
+	waitForSignal(t, done, "notification processing to finish")
+	waitForNotificationJobStatus(t, db, chatID, "sent")
+}
+
 func TestIntegrationNotificationSubscriptionCheckTimesOutBeforeLease(t *testing.T) {
 	db := setupIntegrationDB(t)
 	var sendCalls int
@@ -1798,6 +1913,46 @@ func insertSubscriber(t *testing.T, db *sql.DB, chatID int64, subscribed bool, i
 	)
 	if err != nil {
 		t.Fatalf("insert subscriber %d: %v", chatID, err)
+	}
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func assertOutboxClaimUnchanged(
+	t *testing.T,
+	db *sql.DB,
+	table string,
+	jobID int64,
+	wantToken string,
+	wantAttempts int,
+) {
+	t.Helper()
+	if table != "notification_jobs" && table != "telegram_replies" {
+		t.Fatalf("unsupported outbox table %q", table)
+	}
+
+	query := fmt.Sprintf("SELECT claim_token::text, attempts FROM %s WHERE id = $1", table)
+	var token string
+	var attempts int
+	if err := db.QueryRow(query, jobID).Scan(&token, &attempts); err != nil {
+		t.Fatalf("read %s claim: %v", table, err)
+	}
+	if token != wantToken || attempts != wantAttempts {
+		t.Fatalf(
+			"%s claim changed while chat lock was held: token=%q attempts=%d, want token=%q attempts=%d",
+			table,
+			token,
+			attempts,
+			wantToken,
+			wantAttempts,
+		)
 	}
 }
 

@@ -170,9 +170,9 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 		_ = tx.Rollback()
 	}()
 
-	var job TelegramReplyJob
-	err = tx.QueryRowContext(dbCtx, `WITH next_reply AS (
-		SELECT tr.id
+	var jobID int64
+	var chatID int64
+	err = tx.QueryRowContext(dbCtx, `SELECT tr.id, tr.chat_id
 		FROM telegram_replies AS tr
 		WHERE tr.status IN ('pending', 'sending')
 		AND tr.next_attempt_at <= NOW()
@@ -190,16 +190,33 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 		)
 		ORDER BY tr.id ASC
 		LIMIT 1
-		FOR UPDATE OF tr SKIP LOCKED
-	), claimed AS (
-		UPDATE telegram_replies AS tr
+		FOR UPDATE OF tr SKIP LOCKED`).Scan(&jobID, &chatID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
+		return nil, err
+	}
+
+	locked, err := tryTelegramChatTransactionLock(dbCtx, tx, chatID)
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
+		return nil, err
+	}
+	if !locked {
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "chat_locked").Inc()
+		return nil, nil
+	}
+
+	var job TelegramReplyJob
+	err = tx.QueryRowContext(dbCtx, `UPDATE telegram_replies AS tr
 		SET status = 'sending',
 		    attempts = tr.attempts + 1,
 		    claim_token = gen_random_uuid(),
 		    claimed_until = NOW() + $1::interval,
 		    updated_at = NOW()
-		FROM next_reply
-		WHERE tr.id = next_reply.id
+		WHERE tr.id = $2
 		RETURNING tr.id,
 		          tr.operation,
 		          tr.chat_id,
@@ -208,9 +225,7 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 		          tr.reply_markup::text,
 		          tr.claim_token::text,
 		          tr.attempts
-	)
-	SELECT id, operation, chat_id, message_id, message_text, reply_markup, claim_token, attempts
-	FROM claimed`, workers.PostgresInterval(workers.TelegramReplyClaimWindow)).Scan(
+	`, workers.PostgresInterval(workers.TelegramReplyClaimWindow), jobID).Scan(
 		&job.ID,
 		&job.Operation,
 		&job.ChatID,
@@ -220,9 +235,6 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 		&job.ClaimToken,
 		&job.Attempts,
 	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
 	if err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
 		return nil, err
@@ -238,6 +250,28 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 }
 
 func (a *App) processTelegramReply(ctx context.Context, job TelegramReplyJob) {
+	lockCtx, lockCancel := context.WithTimeout(ctx, workers.TelegramChatLockTimeout)
+	lockConn, lockKey, err := a.acquireTelegramChatAdvisoryLock(lockCtx, job.ChatID)
+	lockCancel()
+	if err != nil {
+		a.deferTelegramReply(ctx, job, fmt.Errorf("acquire telegram chat lock: %w", err))
+		return
+	}
+	defer releaseTelegramChatAdvisoryLock(ctx, lockConn, lockKey)
+
+	claimCtx, claimCancel := context.WithTimeout(ctx, workers.TelegramReplyClaimValidationTimeout)
+	err = a.ensureTelegramReplyClaimCurrent(claimCtx, job)
+	claimCancel()
+	if err != nil {
+		if errors.Is(err, errJobOwnershipLost) {
+			slog.Warn("skipped Telegram reply for stale claim", "reply_id", job.ID, "attempts", job.Attempts)
+			appmetrics.TelegramRepliesTotal.WithLabelValues("skipped_stale_claim").Inc()
+			return
+		}
+		a.deferTelegramReply(ctx, job, fmt.Errorf("validate Telegram reply claim before delivery: %w", err))
+		return
+	}
+
 	telegramMessageID, sendErr := a.sendTelegramReply(job)
 	if sendErr == nil || (job.Operation == telegramReplyEditMessage && isTelegramMessageNotModified(sendErr)) {
 		if telegramMessageID == 0 && job.Operation == telegramReplyEditMessage {
@@ -309,6 +343,50 @@ func (a *App) processTelegramReply(ctx context.Context, job TelegramReplyJob) {
 		"error",
 		safeErr,
 	)
+}
+
+func (a *App) ensureTelegramReplyClaimCurrent(ctx context.Context, job TelegramReplyJob) error {
+	var current bool
+	err := a.db.QueryRowContext(
+		ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			FROM telegram_replies
+			WHERE id = $1
+			AND status = 'sending'
+			AND claim_token = $2::uuid
+			AND attempts = $3
+			AND claimed_until > NOW() + $4::interval
+		)`,
+		job.ID,
+		job.ClaimToken,
+		job.Attempts,
+		workers.PostgresInterval(workers.TelegramSendLeaseSafetyWindow),
+	).Scan(&current)
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("validate_telegram_reply_claim", "error").Inc()
+		return err
+	}
+	if !current {
+		appmetrics.DBOperationsTotal.WithLabelValues("validate_telegram_reply_claim", "stale_claim").Inc()
+		return errJobOwnershipLost
+	}
+
+	appmetrics.DBOperationsTotal.WithLabelValues("validate_telegram_reply_claim", "success").Inc()
+	return nil
+}
+
+func (a *App) deferTelegramReply(ctx context.Context, job TelegramReplyJob, processingErr error) {
+	if job.Attempts >= workers.TelegramReplyMaxAttempts {
+		if err := a.markTelegramReplyFailed(ctx, job, a.safeTelegramError(processingErr)); err != nil {
+			logTelegramReplyFinalizationError("failure", job, err)
+		}
+		return
+	}
+
+	if err := a.markTelegramReplyRetry(ctx, job, processingErr); err != nil {
+		logTelegramReplyFinalizationError("retry", job, err)
+	}
 }
 
 func (a *App) sendTelegramReply(job TelegramReplyJob) (int, error) {

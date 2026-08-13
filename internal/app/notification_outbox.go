@@ -191,9 +191,9 @@ func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob
 		_ = tx.Rollback()
 	}()
 
-	var job NotificationJob
-	err = tx.QueryRowContext(dbCtx, `WITH next_job AS (
-		SELECT nj.id
+	var jobID int64
+	var chatID int64
+	err = tx.QueryRowContext(dbCtx, `SELECT nj.id, nj.chat_id
 		FROM notification_jobs AS nj
 		WHERE nj.status IN ('pending', 'sending')
 		AND nj.next_attempt_at <= NOW()
@@ -204,19 +204,35 @@ func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob
 		)
 		ORDER BY nj.scheduled_at ASC, nj.id ASC
 		LIMIT 1
-		FOR UPDATE OF nj SKIP LOCKED
-	), claimed AS (
-		UPDATE notification_jobs AS nj
+		FOR UPDATE OF nj SKIP LOCKED`).Scan(&jobID, &chatID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+		return nil, err
+	}
+
+	locked, err := tryTelegramChatTransactionLock(dbCtx, tx, chatID)
+	if err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+		return nil, err
+	}
+	if !locked {
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "chat_locked").Inc()
+		return nil, nil
+	}
+
+	var job NotificationJob
+	err = tx.QueryRowContext(dbCtx, `UPDATE notification_jobs AS nj
 		SET status = 'sending',
 		    attempts = nj.attempts + 1,
 		    claim_token = gen_random_uuid(),
 		    claimed_until = NOW() + $1::interval,
 		    updated_at = NOW()
-		FROM next_job
-		WHERE nj.id = next_job.id
+		WHERE nj.id = $2
 		RETURNING nj.id, nj.chat_id, nj.language_code, nj.message_text, nj.claim_token::text, nj.scheduled_at, nj.attempts
-	)
-	SELECT id, chat_id, language_code, message_text, claim_token, scheduled_at, attempts FROM claimed`, workers.PostgresInterval(workers.NotificationJobClaimWindow)).Scan(
+	`, workers.PostgresInterval(workers.NotificationJobClaimWindow), jobID).Scan(
 		&job.ID,
 		&job.ChatID,
 		&job.Lang,
@@ -225,9 +241,6 @@ func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob
 		&job.ScheduledAt,
 		&job.Attempts,
 	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
 	if err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
 		return nil, err
@@ -397,7 +410,7 @@ func (a *App) ensureNotificationJobClaimCurrent(ctx context.Context, job Notific
 		job.ID,
 		job.ClaimToken,
 		job.Attempts,
-		workers.PostgresInterval(workers.NotificationSendLeaseSafetyWindow),
+		workers.PostgresInterval(workers.TelegramSendLeaseSafetyWindow),
 	).Scan(&current)
 	if err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("validate_notification_claim", "error").Inc()
