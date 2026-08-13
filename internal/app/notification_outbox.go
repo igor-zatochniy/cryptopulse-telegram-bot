@@ -191,9 +191,7 @@ func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob
 		_ = tx.Rollback()
 	}()
 
-	var jobID int64
-	var chatID int64
-	err = tx.QueryRowContext(dbCtx, `SELECT nj.id, nj.chat_id
+	rows, err := tx.QueryContext(dbCtx, `SELECT nj.id, nj.chat_id
 		FROM notification_jobs AS nj
 		WHERE nj.status IN ('pending', 'sending')
 		AND nj.next_attempt_at <= NOW()
@@ -203,56 +201,88 @@ func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob
 			OR nj.claimed_until < NOW()
 		)
 		ORDER BY nj.scheduled_at ASC, nj.id ASC
-		LIMIT 1
-		FOR UPDATE OF nj SKIP LOCKED`).Scan(&jobID, &chatID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+		LIMIT $1`, workers.OutboxClaimCandidateLimit)
 	if err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
 		return nil, err
 	}
-
-	locked, err := tryTelegramChatTransactionLock(dbCtx, tx, chatID)
-	if err != nil {
+	type notificationCandidate struct {
+		id     int64
+		chatID int64
+	}
+	candidates := make([]notificationCandidate, 0, workers.OutboxClaimCandidateLimit)
+	for rows.Next() {
+		var candidate notificationCandidate
+		if err := rows.Scan(&candidate.id, &candidate.chatID); err != nil {
+			_ = rows.Close()
+			appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Close(); err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
 		return nil, err
 	}
-	if !locked {
-		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "chat_locked").Inc()
-		return nil, nil
+	if err := rows.Err(); err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+		return nil, err
 	}
 
-	var job NotificationJob
-	err = tx.QueryRowContext(dbCtx, `UPDATE notification_jobs AS nj
+	for _, candidate := range candidates {
+		locked, err := tryTelegramChatTransactionLock(dbCtx, tx, candidate.chatID)
+		if err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+			return nil, err
+		}
+		if !locked {
+			continue
+		}
+
+		var job NotificationJob
+		err = tx.QueryRowContext(dbCtx, `UPDATE notification_jobs AS nj
 		SET status = 'sending',
 		    attempts = nj.attempts + 1,
 		    claim_token = gen_random_uuid(),
 		    claimed_until = NOW() + $1::interval,
 		    updated_at = NOW()
 		WHERE nj.id = $2
+		AND nj.status IN ('pending', 'sending')
+		AND nj.next_attempt_at <= NOW()
+		AND (
+			nj.status = 'pending'
+			OR nj.claimed_until IS NULL
+			OR nj.claimed_until < NOW()
+		)
 		RETURNING nj.id, nj.chat_id, nj.language_code, nj.message_text, nj.claim_token::text, nj.scheduled_at, nj.attempts
-	`, workers.PostgresInterval(workers.NotificationJobClaimWindow), jobID).Scan(
-		&job.ID,
-		&job.ChatID,
-		&job.Lang,
-		&job.Text,
-		&job.ClaimToken,
-		&job.ScheduledAt,
-		&job.Attempts,
-	)
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
-		return nil, err
+	`, workers.PostgresInterval(workers.NotificationJobClaimWindow), candidate.id).Scan(
+			&job.ID,
+			&job.ChatID,
+			&job.Lang,
+			&job.Text,
+			&job.ClaimToken,
+			&job.ScheduledAt,
+			&job.Attempts,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+			return nil, err
+		}
+
+		if err := tx.Commit(); err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
+			return nil, err
+		}
+
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "success").Inc()
+		return &job, nil
 	}
 
-	if err := tx.Commit(); err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "error").Inc()
-		return nil, err
-	}
-
-	appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "success").Inc()
-	return &job, nil
+	appmetrics.DBOperationsTotal.WithLabelValues("claim_notification_job", "no_claimable_candidate").Inc()
+	return nil, nil
 }
 
 func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {

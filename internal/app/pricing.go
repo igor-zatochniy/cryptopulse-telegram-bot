@@ -143,10 +143,14 @@ func parseMarketPrice(raw string) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if math.IsNaN(price) || math.IsInf(price, 0) || price <= 0 {
+	if !isValidMarketPrice(price) {
 		return 0, fmt.Errorf("price must be finite and greater than zero")
 	}
 	return price, nil
+}
+
+func isValidMarketPrice(price float64) bool {
+	return !math.IsNaN(price) && !math.IsInf(price, 0) && price > 0
 }
 
 func (a *App) getFormattedPricesFromCache(lang string) string {
@@ -313,6 +317,10 @@ func (a *App) WarmupCache(ctx context.Context) {
 		var updatedAt time.Time
 		if err := rows.Scan(&s, &p, &updatedAt); err != nil {
 			slog.Error("failed to scan price cache row", "error", err)
+			continue
+		}
+		if !isValidMarketPrice(p) {
+			slog.Warn("skipped invalid persisted market price", "symbol", s)
 			continue
 		}
 		a.priceCache.StoreAt(s, p, updatedAt)

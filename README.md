@@ -177,6 +177,7 @@ goose -dir migrations postgres "$DATABASE_URL" up
 - `006_add_job_claim_token.sql` додає ownership token і unique active-job invariant для notification workers.
 - `007_add_telegram_reply_outbox.sql` додає durable outbox для інтерактивних Telegram send/edit відповідей.
 - `008_add_notification_job_cancellation.sql` додає terminal-статус `canceled` для сповіщень, скасованих після відписки.
+- `009_harden_market_price_constraint.sql` видаляє некоректні legacy-ціни та вимагає додатне скінченне значення для кожної нової ціни.
 
 ## Локальна розробка
 
@@ -299,8 +300,8 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - Inbox retention видаляє `processed` updates після 7 днів, а `failed` updates після 30 днів; `pending` і `processing` updates не видаляються.
 - Reply outbox retention видаляє `sent` replies після 7 днів, а `failed` replies після 30 днів.
 - `shard_id` обчислюється за постійними 64 логічними shards; змінна кількість workers детерміновано розподіляє між собою всі shards.
-- Query operations і session-level advisory locks використовують окремі PostgreSQL pools із сумарним лімітом 24 connections на replica.
-- Lock budget покриває 4 update workers, 3 notification workers і 1 cron advisory lock; перевищення worker limit відхиляється під час завантаження config.
+- Query operations і session-level advisory locks використовують окремі PostgreSQL pools із сумарним лімітом 28 connections на replica.
+- Lock budget покриває 4 update workers, 3 notification workers, 3 reply workers, 1 cron advisory lock і 1 operational reserve; перевищення worker limit відхиляється під час завантаження config.
 - HTTP server, price ticker, retention cleaner та всі worker pools відстежуються спільним `WaitGroup`.
 - Єдиний 30-секундний shutdown budget охоплює HTTP shutdown, producer drain і worker drain; DB закривається тільки після завершення tracked goroutines.
 - Незавершені inbox/outbox rows повторно підхоплюються після lease timeout.

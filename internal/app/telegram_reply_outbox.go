@@ -170,9 +170,7 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 		_ = tx.Rollback()
 	}()
 
-	var jobID int64
-	var chatID int64
-	err = tx.QueryRowContext(dbCtx, `SELECT tr.id, tr.chat_id
+	rows, err := tx.QueryContext(dbCtx, `SELECT tr.id, tr.chat_id
 		FROM telegram_replies AS tr
 		WHERE tr.status IN ('pending', 'sending')
 		AND tr.next_attempt_at <= NOW()
@@ -189,34 +187,66 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 			AND earlier.id < tr.id
 		)
 		ORDER BY tr.id ASC
-		LIMIT 1
-		FOR UPDATE OF tr SKIP LOCKED`).Scan(&jobID, &chatID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+		LIMIT $1`, workers.OutboxClaimCandidateLimit)
 	if err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
 		return nil, err
 	}
-
-	locked, err := tryTelegramChatTransactionLock(dbCtx, tx, chatID)
-	if err != nil {
+	type replyCandidate struct {
+		id     int64
+		chatID int64
+	}
+	candidates := make([]replyCandidate, 0, workers.OutboxClaimCandidateLimit)
+	for rows.Next() {
+		var candidate replyCandidate
+		if err := rows.Scan(&candidate.id, &candidate.chatID); err != nil {
+			_ = rows.Close()
+			appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Close(); err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
 		return nil, err
 	}
-	if !locked {
-		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "chat_locked").Inc()
-		return nil, nil
+	if err := rows.Err(); err != nil {
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
+		return nil, err
 	}
 
-	var job TelegramReplyJob
-	err = tx.QueryRowContext(dbCtx, `UPDATE telegram_replies AS tr
+	for _, candidate := range candidates {
+		locked, err := tryTelegramChatTransactionLock(dbCtx, tx, candidate.chatID)
+		if err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
+			return nil, err
+		}
+		if !locked {
+			continue
+		}
+
+		var job TelegramReplyJob
+		err = tx.QueryRowContext(dbCtx, `UPDATE telegram_replies AS tr
 		SET status = 'sending',
 		    attempts = tr.attempts + 1,
 		    claim_token = gen_random_uuid(),
 		    claimed_until = NOW() + $1::interval,
 		    updated_at = NOW()
 		WHERE tr.id = $2
+		AND tr.status IN ('pending', 'sending')
+		AND tr.next_attempt_at <= NOW()
+		AND (
+			tr.status = 'pending'
+			OR tr.claimed_until IS NULL
+			OR tr.claimed_until < NOW()
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM telegram_replies AS earlier
+			WHERE earlier.chat_id = tr.chat_id
+			AND earlier.status IN ('pending', 'sending')
+			AND earlier.id < tr.id
+		)
 		RETURNING tr.id,
 		          tr.operation,
 		          tr.chat_id,
@@ -225,28 +255,35 @@ func (a *App) claimPendingTelegramReply(ctx context.Context) (*TelegramReplyJob,
 		          tr.reply_markup::text,
 		          tr.claim_token::text,
 		          tr.attempts
-	`, workers.PostgresInterval(workers.TelegramReplyClaimWindow), jobID).Scan(
-		&job.ID,
-		&job.Operation,
-		&job.ChatID,
-		&job.MessageID,
-		&job.Text,
-		&job.ReplyMarkup,
-		&job.ClaimToken,
-		&job.Attempts,
-	)
-	if err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
-		return nil, err
+	`, workers.PostgresInterval(workers.TelegramReplyClaimWindow), candidate.id).Scan(
+			&job.ID,
+			&job.Operation,
+			&job.ChatID,
+			&job.MessageID,
+			&job.Text,
+			&job.ReplyMarkup,
+			&job.ClaimToken,
+			&job.Attempts,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
+			return nil, err
+		}
+
+		if err := tx.Commit(); err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
+			return nil, err
+		}
+
+		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "success").Inc()
+		return &job, nil
 	}
 
-	if err := tx.Commit(); err != nil {
-		appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "error").Inc()
-		return nil, err
-	}
-
-	appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "success").Inc()
-	return &job, nil
+	appmetrics.DBOperationsTotal.WithLabelValues("claim_telegram_reply", "no_claimable_candidate").Inc()
+	return nil, nil
 }
 
 func (a *App) processTelegramReply(ctx context.Context, job TelegramReplyJob) {

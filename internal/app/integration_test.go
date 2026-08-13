@@ -774,6 +774,37 @@ func TestIntegrationTelegramReplyReclaimWaitsForActiveSend(t *testing.T) {
 	assertTelegramReplyState(t, db, chatID, "sent", job.Attempts)
 }
 
+func TestIntegrationTelegramReplyClaimSkipsBusyChat(t *testing.T) {
+	db := setupIntegrationDB(t)
+	appA := newIntegrationApp(t, db, newFakeTelegramBot(t, nil))
+	appB := newIntegrationApp(t, db, newFakeTelegramBot(t, nil))
+
+	const busyChatID int64 = 323
+	const readyChatID int64 = 324
+	insertTelegramReplyForRetention(t, db, busyChatID, "pending", time.Now().Add(-2*time.Minute))
+	insertTelegramReplyForRetention(t, db, readyChatID, "pending", time.Now().Add(-time.Minute))
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	lockConn, lockKey, err := appA.acquireTelegramChatAdvisoryLock(lockCtx, busyChatID)
+	lockCancel()
+	if err != nil {
+		t.Fatalf("lock busy Telegram reply chat: %v", err)
+	}
+	defer releaseTelegramChatAdvisoryLock(context.Background(), lockConn, lockKey)
+
+	job, err := appB.claimPendingTelegramReply(context.Background())
+	if err != nil {
+		t.Fatalf("claim Telegram reply behind busy chat: %v", err)
+	}
+	if job == nil {
+		t.Fatal("claim returned nil while another chat had a due reply")
+	}
+	if job.ChatID != readyChatID {
+		t.Fatalf("claimed chat = %d, want ready chat %d", job.ChatID, readyChatID)
+	}
+	assertTableStatusCount(t, db, "telegram_replies", "pending", 1)
+}
+
 func TestIntegrationReducedWorkerCountClaimsLegacyShard(t *testing.T) {
 	db := setupIntegrationDB(t)
 	bot := newFakeTelegramBot(t, nil)
@@ -1407,6 +1438,154 @@ func TestIntegrationNotificationReclaimWaitsForActiveSend(t *testing.T) {
 	release()
 	waitForSignal(t, done, "notification processing to finish")
 	waitForNotificationJobStatus(t, db, chatID, "sent")
+}
+
+func TestIntegrationNotificationClaimSkipsBusyChat(t *testing.T) {
+	db := setupIntegrationDB(t)
+	appA := newIntegrationApp(t, db, newFakeTelegramBot(t, nil))
+	appB := newIntegrationApp(t, db, newFakeTelegramBot(t, nil))
+
+	const busyChatID int64 = 325
+	const readyChatID int64 = 326
+	insertNotificationJobForRetention(
+		t,
+		db,
+		busyChatID,
+		"pending",
+		time.Now().Add(-2*time.Minute),
+		sql.NullTime{},
+	)
+	insertNotificationJobForRetention(
+		t,
+		db,
+		readyChatID,
+		"pending",
+		time.Now().Add(-time.Minute),
+		sql.NullTime{},
+	)
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	lockConn, lockKey, err := appA.acquireTelegramChatAdvisoryLock(lockCtx, busyChatID)
+	lockCancel()
+	if err != nil {
+		t.Fatalf("lock busy notification chat: %v", err)
+	}
+	defer releaseTelegramChatAdvisoryLock(context.Background(), lockConn, lockKey)
+
+	job, err := appB.claimPendingNotificationJob(context.Background())
+	if err != nil {
+		t.Fatalf("claim notification behind busy chat: %v", err)
+	}
+	if job == nil {
+		t.Fatal("claim returned nil while another chat had a due notification")
+	}
+	if job.ChatID != readyChatID {
+		t.Fatalf("claimed chat = %d, want ready chat %d", job.ChatID, readyChatID)
+	}
+	assertTableStatusCount(t, db, "notification_jobs", "pending", 1)
+}
+
+func TestIntegrationWarmupCacheSkipsInvalidPersistedPrices(t *testing.T) {
+	db := setupIntegrationDB(t)
+	if _, err := db.Exec(`ALTER TABLE market_prices DROP CONSTRAINT market_prices_price_check`); err != nil {
+		t.Fatalf("drop market price constraint for legacy data test: %v", err)
+	}
+
+	for _, statement := range []string{
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('VALIDUSDT', 123.45, NOW())`,
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('ZEROUSDT', 0, NOW())`,
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('NANUSDT', 'NaN'::double precision, NOW())`,
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('INFUSDT', 'Infinity'::double precision, NOW())`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("seed persisted market price: %v", err)
+		}
+	}
+
+	app := &App{db: db, priceCache: &PriceCache{store: make(map[string]PriceEntry)}}
+	app.WarmupCache(context.Background())
+
+	if entry, ok := app.priceCache.Load("VALIDUSDT"); !ok || entry.Current != 123.45 {
+		t.Fatalf("valid persisted price was not loaded: entry=%+v present=%t", entry, ok)
+	}
+	for _, symbol := range []string{"ZEROUSDT", "NANUSDT", "INFUSDT"} {
+		if entry, ok := app.priceCache.Load(symbol); ok {
+			t.Fatalf("invalid persisted price %s was loaded: %+v", symbol, entry)
+		}
+	}
+}
+
+func TestIntegrationMarketPriceConstraintRejectsInvalidDomain(t *testing.T) {
+	db := setupIntegrationDB(t)
+
+	invalidValues := []string{
+		`0`,
+		`-1`,
+		`'NaN'::double precision`,
+		`'Infinity'::double precision`,
+		`'-Infinity'::double precision`,
+	}
+	for index, value := range invalidValues {
+		statement := fmt.Sprintf(
+			"INSERT INTO market_prices (symbol, price, updated_at) VALUES ('INVALID%d', %s, NOW())",
+			index,
+			value,
+		)
+		if _, err := db.Exec(statement); err == nil {
+			t.Fatalf("market price constraint accepted invalid value %s", value)
+		}
+	}
+
+	if _, err := db.Exec(
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('VALID', 1, NOW())`,
+	); err != nil {
+		t.Fatalf("market price constraint rejected valid value: %v", err)
+	}
+}
+
+func TestIntegrationMarketPriceMigrationCleansLegacyInvalidRows(t *testing.T) {
+	db := setupIntegrationDB(t)
+	if _, err := db.Exec(`ALTER TABLE market_prices DROP CONSTRAINT market_prices_price_check`); err != nil {
+		t.Fatalf("drop current market price constraint: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM goose_db_version WHERE version_id = 9`); err != nil {
+		t.Fatalf("rewind market price migration version: %v", err)
+	}
+
+	for _, statement := range []string{
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('VALID', 42, NOW())`,
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('ZERO', 0, NOW())`,
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('NAN', 'NaN'::double precision, NOW())`,
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('INF', 'Infinity'::double precision, NOW())`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("seed legacy market price: %v", err)
+		}
+	}
+
+	if _, err := storage.ApplyMigrations(context.Background(), db); err != nil {
+		t.Fatalf("reapply market price hardening migration: %v", err)
+	}
+
+	var remaining int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM market_prices`).Scan(&remaining); err != nil {
+		t.Fatalf("count prices after hardening migration: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("remaining market prices = %d, want 1", remaining)
+	}
+	var symbol string
+	if err := db.QueryRow(`SELECT symbol FROM market_prices`).Scan(&symbol); err != nil {
+		t.Fatalf("read preserved market price: %v", err)
+	}
+	if symbol != "VALID" {
+		t.Fatalf("preserved market price = %q, want VALID", symbol)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('INVALID_AFTER_UPGRADE', 0, NOW())`,
+	); err == nil {
+		t.Fatal("reapplied market price constraint accepted zero")
+	}
 }
 
 func TestIntegrationNotificationSubscriptionCheckTimesOutBeforeLease(t *testing.T) {

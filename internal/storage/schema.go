@@ -23,6 +23,7 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		jobClaimTokenColumn    bool
 		jobCanceledAtColumn    bool
 		updateShardColumn      bool
+		marketPriceConstraint  bool
 	)
 
 	err := db.QueryRowContext(checkCtx, `SELECT
@@ -58,6 +59,12 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 			WHERE table_schema = 'public'
 			AND table_name = 'telegram_updates'
 			AND column_name = 'shard_id'
+		),
+		EXISTS (
+			SELECT 1
+			FROM pg_constraint
+			WHERE conrelid = 'public.market_prices'::regclass
+			AND conname = 'market_prices_price_check'
 		)`).Scan(
 		&subscribersTable,
 		&marketPricesTable,
@@ -68,6 +75,7 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		&jobClaimTokenColumn,
 		&jobCanceledAtColumn,
 		&updateShardColumn,
+		&marketPriceConstraint,
 	)
 	if err != nil {
 		return fmt.Errorf("inspect database schema: %w", err)
@@ -86,6 +94,7 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		{"column notification_jobs.claim_token", jobClaimTokenColumn},
 		{"column notification_jobs.canceled_at", jobCanceledAtColumn},
 		{"column telegram_updates.shard_id", updateShardColumn},
+		{"constraint market_prices_price_check", marketPriceConstraint},
 	}
 
 	var missing []string

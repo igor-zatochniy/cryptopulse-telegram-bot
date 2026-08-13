@@ -17,6 +17,7 @@ const (
 	LockPoolOperationalReserve          = 1
 	MaxTelegramUpdateWorkerCount        = DatabaseLockPoolMaxOpenConnections - NotificationWorkerCount - TelegramReplyWorkerCount - CronLockConnectionReserve - LockPoolOperationalReserve
 	CronBatchLimit                      = 100
+	OutboxClaimCandidateLimit           = 10
 	TelegramUpdateShardCount            = 64
 	DefaultTelegramUpdateWorkerCount    = MaxTelegramUpdateWorkerCount
 	TelegramUpdatePollInterval          = 2 * time.Second
