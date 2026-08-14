@@ -1,5 +1,5 @@
 # === Етап 1: Збирання ===
-FROM golang:1.25.12-alpine@sha256:d9107c276282158d647eae06a3a7358e3f38c6076e52551149300f0c3ce99b7c AS builder
+FROM golang:1.25.13-alpine@sha256:844b27705f54e73773e0f9bc3c780633b9d7f4b4831bf35cdad02a81a4c80bd0 AS builder
 WORKDIR /app
 
 COPY go.mod go.sum ./

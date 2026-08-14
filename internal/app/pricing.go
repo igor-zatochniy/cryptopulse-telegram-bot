@@ -75,7 +75,8 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 			}
 
 			var data struct {
-				Price string `json:"price"`
+				Symbol string `json:"symbol"`
+				Price  string `json:"price"`
 			}
 			limitedBody := io.LimitReader(resp.Body, 102400)
 			if err := json.NewDecoder(limitedBody).Decode(&data); err != nil {
@@ -86,6 +87,17 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 					c.Symbol,
 					"error",
 					err,
+				)
+				return
+			}
+			if data.Symbol != c.Symbol {
+				appmetrics.BinanceRequestsTotal.WithLabelValues(c.Symbol, "symbol_mismatch").Inc()
+				slog.Error(
+					"binance ticker symbol does not match request",
+					"expected_symbol",
+					c.Symbol,
+					"received_symbol",
+					data.Symbol,
 				)
 				return
 			}

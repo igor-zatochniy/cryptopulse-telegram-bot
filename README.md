@@ -74,7 +74,7 @@ flowchart LR
 
 ## Технологічний стек
 
-- Go 1.25.12
+- Go 1.25.13
 - PostgreSQL
 - Telegram Bot API
 - Binance public ticker API
@@ -181,7 +181,7 @@ goose -dir migrations postgres "$DATABASE_URL" up
 
 ## Локальна розробка
 
-Встановіть Go 1.25.12 або дозвольте Go toolchain directive завантажити потрібну версію автоматично.
+Встановіть Go 1.25.13 або дозвольте Go toolchain directive завантажити потрібну версію автоматично.
 
 ```bash
 go mod download

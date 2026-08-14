@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -38,6 +39,12 @@ type fakeTelegramResponse struct {
 	OK          bool
 	ErrorCode   int
 	Description string
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 type fakeTelegramServer struct {
@@ -1585,6 +1592,70 @@ func TestIntegrationMarketPriceMigrationCleansLegacyInvalidRows(t *testing.T) {
 		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ('INVALID_AFTER_UPGRADE', 0, NOW())`,
 	); err == nil {
 		t.Fatal("reapplied market price constraint accepted zero")
+	}
+}
+
+func TestIntegrationFetchAndCachePricesRejectsMismatchedSymbol(t *testing.T) {
+	db := setupIntegrationDB(t)
+	const initialBTCPrice = 62500.0
+	initialUpdatedAt := time.Date(2026, time.August, 14, 8, 0, 0, 0, time.UTC)
+	if _, err := db.Exec(
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ($1, $2, $3)`,
+		"BTCUSDT",
+		initialBTCPrice,
+		initialUpdatedAt,
+	); err != nil {
+		t.Fatalf("seed BTC market price: %v", err)
+	}
+
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestedSymbol := request.URL.Query().Get("symbol")
+		responseSymbol := requestedSymbol
+		price := "100.00"
+		if requestedSymbol == "BTCUSDT" {
+			responseSymbol = "ETHUSDT"
+			price = "2500.00"
+		}
+
+		payload := fmt.Sprintf(`{"symbol":%q,"price":%q}`, responseSymbol, price)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(payload)),
+			Request:    request,
+		}, nil
+	})}
+	app := &App{
+		db:         db,
+		priceCache: &PriceCache{store: make(map[string]PriceEntry)},
+		httpClient: client,
+	}
+	app.priceCache.StoreAt("BTCUSDT", initialBTCPrice, initialUpdatedAt)
+
+	app.fetchAndCachePrices(context.Background())
+
+	entry, ok := app.priceCache.Load("BTCUSDT")
+	if !ok {
+		t.Fatal("BTC price disappeared from cache")
+	}
+	if entry.Current != initialBTCPrice || !entry.UpdatedAt.Equal(initialUpdatedAt) {
+		t.Fatalf("BTC cache changed after symbol mismatch: %+v", entry)
+	}
+
+	var storedPrice float64
+	var storedUpdatedAt time.Time
+	if err := db.QueryRow(
+		`SELECT price, updated_at FROM market_prices WHERE symbol = $1`,
+		"BTCUSDT",
+	).Scan(&storedPrice, &storedUpdatedAt); err != nil {
+		t.Fatalf("read BTC market price: %v", err)
+	}
+	if storedPrice != initialBTCPrice || !storedUpdatedAt.Equal(initialUpdatedAt) {
+		t.Fatalf(
+			"BTC database row changed after symbol mismatch: price=%v updated_at=%v",
+			storedPrice,
+			storedUpdatedAt,
+		)
 	}
 }
 
