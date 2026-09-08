@@ -45,6 +45,24 @@ func TestLoadRejectsTelegramUpdateWorkerCountAboveConnectionBudget(t *testing.T)
 	}
 }
 
+func TestLoadRejectsMissingMetricsSecret(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv("METRICS_SECRET", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected missing METRICS_SECRET error")
+	}
+}
+
+func TestLoadRejectsMetricsSecretMatchingCronSecret(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv("METRICS_SECRET", "cron-secret")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected shared metrics and cron secret error")
+	}
+}
+
 func setRequiredEnvironment(t *testing.T) {
 	t.Helper()
 

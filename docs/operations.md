@@ -47,6 +47,7 @@ Hetzner PostgreSQL
 
 - Відкрити pull request і переконатися, що CI green до merge в `main`.
 - Перевірити, що `.env.example` не містить реальних секретів.
+- Перевірити, що `METRICS_SECRET` заданий окремо та відрізняється від `CRON_SECRET`.
 - Для schema changes зробити backup PostgreSQL до merge.
 - Переконатися, що нова migration є backward-compatible для поточної версії сервісу.
 - Merge в `main` і дочекатися нового Koyeb deployment.
@@ -284,6 +285,8 @@ Metrics endpoint потребує Bearer token:
 curl -H "Authorization: Bearer $METRICS_SECRET" \
   https://<service-domain>/metrics
 ```
+
+`METRICS_SECRET` є обов'язковим і має відрізнятися від `CRON_SECRET`, щоб доступ до read-only metrics не надавав право запускати cron.
 
 Корисні метрики:
 

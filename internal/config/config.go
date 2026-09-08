@@ -51,9 +51,6 @@ func Load() (Config, error) {
 		Port:                  Port(),
 		TelegramUpdateWorkers: updateWorkers,
 	}
-	if cfg.MetricsSecret == "" {
-		cfg.MetricsSecret = cfg.CronSecret
-	}
 
 	required := []struct {
 		name  string
@@ -63,11 +60,15 @@ func Load() (Config, error) {
 		{"TELEGRAM_APITOKEN", cfg.TelegramToken},
 		{"WEBHOOK_SECRET_TOKEN", cfg.WebhookSecret},
 		{"CRON_SECRET", cfg.CronSecret},
+		{"METRICS_SECRET", cfg.MetricsSecret},
 	}
 	for _, variable := range required {
 		if variable.value == "" {
 			return Config{}, fmt.Errorf("required environment variable %s is missing", variable.name)
 		}
+	}
+	if cfg.MetricsSecret == cfg.CronSecret {
+		return Config{}, fmt.Errorf("METRICS_SECRET must differ from CRON_SECRET")
 	}
 
 	return cfg, nil

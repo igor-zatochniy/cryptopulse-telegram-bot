@@ -135,7 +135,7 @@ cp .env.example .env
 | `TELEGRAM_APITOKEN` | yes | Telegram bot token від BotFather. |
 | `WEBHOOK_SECRET_TOKEN` | yes | Secret, який очікується від Telegram webhook requests. |
 | `CRON_SECRET` | yes | Bearer secret для `/cron`. |
-| `METRICS_SECRET` | no | Окремий Bearer secret для `/metrics`; без нього використовується `CRON_SECRET`. |
+| `METRICS_SECRET` | yes | Окремий Bearer secret для `/metrics`; має відрізнятися від `CRON_SECRET`. |
 | `PORT` | no | HTTP port. За замовчуванням `8080`. |
 | `TELEGRAM_UPDATE_WORKERS` | no | Кількість inbox workers від `1` до `4`. За замовчуванням `4`; логічні 64 shards залишаються незмінним форматом даних. |
 
@@ -269,11 +269,11 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 
 - Secrets читаються тільки з environment variables.
 - Telegram webhook requests потребують `WEBHOOK_SECRET_TOKEN`.
-- Cron і metrics endpoints потребують Bearer authentication.
+- Cron і metrics endpoints потребують різних Bearer secrets.
 - Тіло webhook request має обмеження за розміром.
 - Webhook повертає `200 OK` тільки після збереження update у PostgreSQL.
 - HTTP methods явно перевіряються.
-- Cron має глобальний rate limit, а webhook обмежується окремо для кожного remote client.
+- Cron має глобальний rate limit. Webhook limiter використовує видимий `RemoteAddr`; за reverse proxy це може бути спільний proxy-level budget.
 - PostgreSQL не має бути відкритим у public internet. У production обмежуйте `5432/tcp` trusted egress IPs, private networking або VPN.
 - Docker runtime не запускається від root.
 
