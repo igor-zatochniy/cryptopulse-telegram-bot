@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/pressly/goose/v3"
@@ -23,14 +25,13 @@ func ApplyMigrations(ctx context.Context, db *sql.DB) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("open migration lock connection: %w", err)
 	}
-	defer lockConn.Close()
 
 	if _, err := lockConn.ExecContext(
 		migrationCtx,
 		`SELECT pg_advisory_lock($1)`,
 		migrationAdvisoryLockKey,
 	); err != nil {
-		return 0, fmt.Errorf("acquire migration advisory lock: %w", err)
+		return 0, fmt.Errorf("acquire migration advisory lock: %w", errors.Join(err, DiscardConnection(lockConn)))
 	}
 	defer releaseMigrationLock(lockConn)
 
@@ -50,9 +51,7 @@ func releaseMigrationLock(conn *sql.Conn) {
 	releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, _ = conn.ExecContext(
-		releaseCtx,
-		`SELECT pg_advisory_unlock($1)`,
-		migrationAdvisoryLockKey,
-	)
+	if err := ReleaseAdvisoryLock(releaseCtx, conn, migrationAdvisoryLockKey); err != nil {
+		slog.Error("failed to release migration advisory lock", "error", err)
+	}
 }

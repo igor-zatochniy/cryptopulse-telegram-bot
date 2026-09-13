@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/httpserver"
 	appmetrics "github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/metrics"
+	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/storage"
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/workers"
 )
 
@@ -184,8 +186,7 @@ func (a *App) acquireCronAdvisoryLock(ctx context.Context) (*sql.Conn, bool, err
 
 	var acquired bool
 	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, workers.CronAdvisoryLockKey).Scan(&acquired); err != nil {
-		_ = conn.Close()
-		return nil, false, err
+		return nil, false, errors.Join(err, storage.DiscardConnection(conn))
 	}
 
 	if !acquired {
@@ -204,11 +205,8 @@ func releaseCronAdvisoryLock(ctx context.Context, conn *sql.Conn) {
 	releaseCtx, cancel := finalizationContext(ctx, 2*time.Second)
 	defer cancel()
 
-	if _, err := conn.ExecContext(releaseCtx, `SELECT pg_advisory_unlock($1)`, workers.CronAdvisoryLockKey); err != nil {
+	if err := storage.ReleaseAdvisoryLock(releaseCtx, conn, workers.CronAdvisoryLockKey); err != nil {
 		slog.Error("failed to release cron advisory lock", "error", err)
-	}
-	if err := conn.Close(); err != nil {
-		slog.Error("failed to close cron advisory lock connection", "error", err)
 	}
 }
 

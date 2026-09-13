@@ -15,6 +15,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	appmetrics "github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/metrics"
+	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/storage"
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/workers"
 )
 
@@ -258,9 +259,8 @@ func (a *App) acquireTelegramChatAdvisoryLock(ctx context.Context, chatID int64)
 
 	lockKey := telegramChatAdvisoryLockKey(chatID)
 	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
-		_ = conn.Close()
 		appmetrics.DBOperationsTotal.WithLabelValues("acquire_telegram_chat_lock", "error").Inc()
-		return nil, lockKey, err
+		return nil, lockKey, errors.Join(err, storage.DiscardConnection(conn))
 	}
 
 	appmetrics.DBOperationsTotal.WithLabelValues("acquire_telegram_chat_lock", "success").Inc()
@@ -275,11 +275,8 @@ func releaseTelegramChatAdvisoryLock(ctx context.Context, conn *sql.Conn, lockKe
 	releaseCtx, cancel := finalizationContext(ctx, 2*time.Second)
 	defer cancel()
 
-	if _, err := conn.ExecContext(releaseCtx, `SELECT pg_advisory_unlock($1)`, lockKey); err != nil {
+	if err := storage.ReleaseAdvisoryLock(releaseCtx, conn, lockKey); err != nil {
 		slog.Error("failed to release telegram chat advisory lock", "error", err)
-	}
-	if err := conn.Close(); err != nil {
-		slog.Error("failed to close telegram chat advisory lock connection", "error", err)
 	}
 }
 
