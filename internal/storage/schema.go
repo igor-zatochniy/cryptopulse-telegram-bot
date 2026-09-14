@@ -24,6 +24,8 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		jobCanceledAtColumn    bool
 		updateShardColumn      bool
 		marketPriceConstraint  bool
+		priceAlertsTable       bool
+		priceAlertJobsIndex    bool
 	)
 
 	err := db.QueryRowContext(checkCtx, `SELECT
@@ -32,6 +34,8 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		to_regclass('public.notification_jobs') IS NOT NULL,
 		to_regclass('public.telegram_updates') IS NOT NULL,
 		to_regclass('public.telegram_replies') IS NOT NULL,
+		to_regclass('public.price_alerts') IS NOT NULL,
+		to_regclass('public.notification_jobs_one_per_price_alert') IS NOT NULL,
 		EXISTS (
 			SELECT 1
 			FROM information_schema.columns
@@ -71,6 +75,8 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		&notificationJobsTable,
 		&telegramUpdatesTable,
 		&telegramRepliesTable,
+		&priceAlertsTable,
+		&priceAlertJobsIndex,
 		&deliveryCooldownColumn,
 		&jobClaimTokenColumn,
 		&jobCanceledAtColumn,
@@ -90,6 +96,8 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		{"table notification_jobs", notificationJobsTable},
 		{"table telegram_updates", telegramUpdatesTable},
 		{"table telegram_replies", telegramRepliesTable},
+		{"table price_alerts", priceAlertsTable},
+		{"index notification_jobs_one_per_price_alert", priceAlertJobsIndex},
 		{"column subscribers.delivery_suspended_until", deliveryCooldownColumn},
 		{"column notification_jobs.claim_token", jobClaimTokenColumn},
 		{"column notification_jobs.canceled_at", jobCanceledAtColumn},

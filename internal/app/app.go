@@ -69,13 +69,15 @@ func (c *PriceCache) StoreAt(symbol string, newPrice float64, updatedAt time.Tim
 }
 
 type NotificationJob struct {
-	ID          int64
-	ChatID      int64
-	Lang        string
-	Text        string
-	ClaimToken  string
-	ScheduledAt time.Time
-	Attempts    int
+	Kind         string
+	PriceAlertID int64
+	ID           int64
+	ChatID       int64
+	Lang         string
+	Text         string
+	ClaimToken   string
+	ScheduledAt  time.Time
+	Attempts     int
 }
 
 type TelegramUpdateJob struct {
@@ -87,24 +89,26 @@ type TelegramUpdateJob struct {
 
 type databaseExecutor interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // --- СТРУКТУРА ЗАСТОСУНКУ (DEPENDENCY INJECTION) ---
 
 type App struct {
-	db            *sql.DB
-	lockDB        *sql.DB
-	bot           *tgbotapi.BotAPI
-	priceCache    *PriceCache
-	kyivLoc       *time.Location
-	httpClient    *http.Client
-	webhookSecret string
-	cronSecret    string
-	metricsSecret string
-	producerMu    sync.Mutex
-	producerWG    sync.WaitGroup
-	shuttingDown  bool
+	db                 *sql.DB
+	lockDB             *sql.DB
+	bot                *tgbotapi.BotAPI
+	priceCache         *PriceCache
+	kyivLoc            *time.Location
+	httpClient         *http.Client
+	webhookSecret      string
+	cronSecret         string
+	metricsSecret      string
+	priceAlertsEnabled bool
+	producerMu         sync.Mutex
+	producerWG         sync.WaitGroup
+	shuttingDown       bool
 }
 
 func (a *App) lockDatabase() *sql.DB {

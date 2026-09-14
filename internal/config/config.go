@@ -22,6 +22,7 @@ type Config struct {
 	MetricsSecret         string
 	Port                  string
 	TelegramUpdateWorkers int
+	PriceAlertsEnabled    bool
 }
 
 // Load читає локальний .env, якщо він існує, та перевіряє обов'язкові змінні.
@@ -42,6 +43,13 @@ func Load() (Config, error) {
 		)
 	}
 
+	alertsEnabled := false
+	if raw := os.Getenv("PRICE_ALERTS_ENABLED"); raw != "" {
+		alertsEnabled, err = strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("PRICE_ALERTS_ENABLED must be a boolean")
+		}
+	}
 	cfg := Config{
 		DatabaseURL:           os.Getenv("DATABASE_URL"),
 		TelegramToken:         os.Getenv("TELEGRAM_APITOKEN"),
@@ -50,6 +58,7 @@ func Load() (Config, error) {
 		MetricsSecret:         os.Getenv("METRICS_SECRET"),
 		Port:                  Port(),
 		TelegramUpdateWorkers: updateWorkers,
+		PriceAlertsEnabled:    alertsEnabled,
 	}
 
 	required := []struct {

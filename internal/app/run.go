@@ -55,15 +55,16 @@ func Run(ctx context.Context, cfg config.Config) error {
 	}
 
 	application := &App{
-		db:            database,
-		lockDB:        lockDatabase,
-		bot:           bot,
-		priceCache:    &PriceCache{store: make(map[string]PriceEntry)},
-		kyivLoc:       kyivLocation,
-		httpClient:    newMarketHTTPClient(),
-		webhookSecret: cfg.WebhookSecret,
-		cronSecret:    cfg.CronSecret,
-		metricsSecret: cfg.MetricsSecret,
+		db:                 database,
+		lockDB:             lockDatabase,
+		bot:                bot,
+		priceCache:         &PriceCache{store: make(map[string]PriceEntry)},
+		kyivLoc:            kyivLocation,
+		httpClient:         newMarketHTTPClient(),
+		webhookSecret:      cfg.WebhookSecret,
+		cronSecret:         cfg.CronSecret,
+		metricsSecret:      cfg.MetricsSecret,
+		priceAlertsEnabled: cfg.PriceAlertsEnabled,
 	}
 
 	runCtx, stopRun := context.WithCancel(ctx)
@@ -74,6 +75,9 @@ func Run(ctx context.Context, cfg config.Config) error {
 	application.WarmupCache(runCtx)
 
 	var runtimeWG sync.WaitGroup
+	startTracked(&runtimeWG, func() {
+		application.syncPriceAlertMenu(runCtx)
+	})
 	startTracked(&runtimeWG, func() {
 		application.startPriceTicker(runCtx)
 	})

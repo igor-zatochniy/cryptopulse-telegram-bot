@@ -71,4 +71,22 @@ func setRequiredEnvironment(t *testing.T) {
 	t.Setenv("WEBHOOK_SECRET_TOKEN", "webhook-secret")
 	t.Setenv("CRON_SECRET", "cron-secret")
 	t.Setenv("METRICS_SECRET", "metrics-secret")
+	t.Setenv("PRICE_ALERTS_ENABLED", "")
+}
+
+func TestPriceAlertsRequireExplicitEnablement(t *testing.T) {
+	setRequiredEnvironment(t)
+	for _, value := range []string{"", "false", "true", "invalid"} {
+		t.Setenv("PRICE_ALERTS_ENABLED", value)
+		cfg, err := Load()
+		if value == "invalid" {
+			if err == nil {
+				t.Fatal("accepted invalid PRICE_ALERTS_ENABLED")
+			}
+			continue
+		}
+		if err != nil || cfg.PriceAlertsEnabled != (value == "true") {
+			t.Fatalf("flag %q: enabled=%v, err=%v", value, cfg.PriceAlertsEnabled, err)
+		}
+	}
 }

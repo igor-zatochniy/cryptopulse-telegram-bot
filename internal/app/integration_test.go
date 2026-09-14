@@ -21,11 +21,13 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/storage"
 	apptelegram "github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/telegram"
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/workers"
+	"github.com/igor-zatochniy/cryptopulse-telegram-bot/migrations"
 )
 
 const (
@@ -1552,6 +1554,13 @@ func TestIntegrationMarketPriceConstraintRejectsInvalidDomain(t *testing.T) {
 
 func TestIntegrationMarketPriceMigrationCleansLegacyInvalidRows(t *testing.T) {
 	db := setupIntegrationDB(t)
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations.Files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(context.Background(), 9); err != nil {
+		t.Fatalf("prepare schema version 9 before replaying its migration: %v", err)
+	}
 	if _, err := db.Exec(`ALTER TABLE market_prices DROP CONSTRAINT market_prices_price_check`); err != nil {
 		t.Fatalf("drop current market price constraint: %v", err)
 	}

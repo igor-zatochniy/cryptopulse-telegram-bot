@@ -93,6 +93,7 @@ func (a *App) createCronNotificationJobs(ctx context.Context) (int, error) {
 			SELECT 1
 			FROM notification_jobs AS nj
 			WHERE nj.chat_id = s.chat_id
+			AND nj.kind = 'scheduled'
 			AND nj.status IN ('pending', 'sending')
 		)
 		ORDER BY s.last_sent ASC NULLS FIRST
@@ -254,7 +255,8 @@ func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob
 			OR nj.claimed_until IS NULL
 			OR nj.claimed_until < NOW()
 		)
-		RETURNING nj.id, nj.chat_id, nj.language_code, nj.message_text, nj.claim_token::text, nj.scheduled_at, nj.attempts
+		RETURNING nj.id, nj.chat_id, nj.language_code, nj.message_text, nj.claim_token::text, nj.scheduled_at, nj.attempts,
+		          nj.kind, COALESCE(nj.price_alert_id, 0)
 	`, workers.PostgresInterval(workers.NotificationJobClaimWindow), candidate.id).Scan(
 			&job.ID,
 			&job.ChatID,
@@ -263,6 +265,8 @@ func (a *App) claimPendingNotificationJob(ctx context.Context) (*NotificationJob
 			&job.ClaimToken,
 			&job.ScheduledAt,
 			&job.Attempts,
+			&job.Kind,
+			&job.PriceAlertID,
 		)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -306,7 +310,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 		ctx,
 		workers.NotificationSubscriptionCheckTimeout,
 	)
-	subscribed, err := a.isSubscribed(subscriptionCtx, job.ChatID)
+	subscribed, err := a.notificationEnabled(subscriptionCtx, job)
 	subscriptionCancel()
 	if err != nil {
 		a.deferNotificationJob(ctx, job, fmt.Errorf("check subscription before delivery: %w", err))
@@ -320,7 +324,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 				slog.Error("failed to persist canceled notification job", "job_id", job.ID, "error", err)
 			}
 		}
-		appmetrics.CronDeliveriesTotal.WithLabelValues("canceled").Inc()
+		observeNotificationDelivery(job, "canceled")
 		return
 	}
 
@@ -330,7 +334,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 	if err != nil {
 		if errors.Is(err, errJobOwnershipLost) {
 			slog.Warn("skipped notification send for stale claim", "job_id", job.ID, "attempts", job.Attempts)
-			appmetrics.CronDeliveriesTotal.WithLabelValues("skipped_stale_claim").Inc()
+			observeNotificationDelivery(job, "skipped_stale_claim")
 			return
 		}
 		a.deferNotificationJob(ctx, job, fmt.Errorf("validate notification claim before delivery: %w", err))
@@ -339,13 +343,15 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 
 	msg := tgbotapi.NewMessage(job.ChatID, notificationMessageForDelivery(job, time.Now().UTC()))
 	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = apptelegram.RefreshKeyboard(job.Lang)
+	if job.Kind != notificationPriceAlert {
+		msg.ReplyMarkup = apptelegram.RefreshKeyboard(job.Lang)
+	}
 
 	sentMessage, err := a.bot.Send(msg)
 	if err != nil {
 		errorType := "transient"
 		safeErr := a.safeTelegramError(err)
-		slog.Error("failed to send scheduled alert", "chat_id", job.ChatID, "error", safeErr)
+		slog.Error("failed to send notification", "kind", job.Kind, "chat_id", job.ChatID, "error", safeErr)
 
 		if apptelegram.IsPermanentSendError(err) {
 			errorType = "permanent"
@@ -376,7 +382,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 		}
 
 		appmetrics.TelegramSendErrorsTotal.WithLabelValues(errorType).Inc()
-		appmetrics.CronDeliveriesTotal.WithLabelValues("failed_" + errorType).Inc()
+		observeNotificationDelivery(job, "failed_"+errorType)
 		return
 	}
 
@@ -392,7 +398,7 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 	if err != nil {
 		if errors.Is(err, errJobOwnershipLost) {
 			slog.Warn("ignored stale notification success result", "job_id", job.ID, "attempts", job.Attempts)
-			appmetrics.CronDeliveriesTotal.WithLabelValues("sent_stale_claim").Inc()
+			observeNotificationDelivery(job, "sent_stale_claim")
 			return
 		}
 
@@ -409,11 +415,19 @@ func (a *App) processNotificationJob(ctx context.Context, job NotificationJob) {
 			"error",
 			err,
 		)
-		appmetrics.CronDeliveriesTotal.WithLabelValues("sent_persist_error").Inc()
+		observeNotificationDelivery(job, "sent_persist_error")
 		return
 	}
 
-	appmetrics.CronDeliveriesTotal.WithLabelValues("sent").Inc()
+	observeNotificationDelivery(job, "sent")
+}
+
+func observeNotificationDelivery(job NotificationJob, status string) {
+	if job.Kind == notificationPriceAlert {
+		appmetrics.PriceAlertDeliveriesTotal.WithLabelValues(status).Inc()
+		return
+	}
+	appmetrics.CronDeliveriesTotal.WithLabelValues(status).Inc()
 }
 
 func notificationMessageForDelivery(job NotificationJob, deliveredAt time.Time) string {
@@ -464,7 +478,7 @@ func (a *App) deferNotificationJob(ctx context.Context, job NotificationJob, pro
 				slog.Error("failed to persist notification failure", "job_id", job.ID, "error", err)
 			}
 		}
-		appmetrics.CronDeliveriesTotal.WithLabelValues("failed_exhausted").Inc()
+		observeNotificationDelivery(job, "failed_exhausted")
 		return
 	}
 
@@ -475,7 +489,7 @@ func (a *App) deferNotificationJob(ctx context.Context, job NotificationJob, pro
 			slog.Error("failed to persist notification retry", "job_id", job.ID, "error", err)
 		}
 	}
-	appmetrics.CronDeliveriesTotal.WithLabelValues("retry").Inc()
+	observeNotificationDelivery(job, "retry")
 }
 
 func (a *App) markNotificationJobSentOnce(ctx context.Context, job NotificationJob) error {
@@ -519,9 +533,10 @@ func (a *App) markNotificationJobSentOnce(ctx context.Context, job NotificationJ
 		 SET last_sent = date_trunc('minute', $2::timestamptz),
 		     cron_claimed_until = NULL,
 		     delivery_suspended_until = NULL
-		 WHERE chat_id = $1`,
+		 WHERE chat_id = $1 AND $3 <> 'price_alert'`,
 		job.ChatID,
 		job.ScheduledAt,
+		job.Kind,
 	); err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_sent", "error").Inc()
 		return err
@@ -584,8 +599,9 @@ func (a *App) markNotificationJobRetry(ctx context.Context, job NotificationJob,
 		dbCtx,
 		`UPDATE subscribers
 		 SET cron_claimed_until = NULL
-		 WHERE chat_id = $1`,
+		 WHERE chat_id = $1 AND $2 <> 'price_alert'`,
 		job.ChatID,
+		job.Kind,
 	); err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_retry", "error").Inc()
 		return err
@@ -620,7 +636,7 @@ func (a *App) markNotificationJobCanceled(ctx context.Context, job NotificationJ
 		     canceled_at = NOW(),
 		     claim_token = NULL,
 		     claimed_until = NULL,
-		     last_error = 'subscriber is not active',
+		     last_error = 'notification disabled',
 		     updated_at = NOW()
 		 WHERE id = $1
 		 AND status = 'sending'
@@ -642,8 +658,9 @@ func (a *App) markNotificationJobCanceled(ctx context.Context, job NotificationJ
 		dbCtx,
 		`UPDATE subscribers
 		 SET cron_claimed_until = NULL
-		 WHERE chat_id = $1`,
+		 WHERE chat_id = $1 AND $2 <> 'price_alert'`,
 		job.ChatID,
+		job.Kind,
 	); err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_canceled", "error").Inc()
 		return err
@@ -710,8 +727,9 @@ func (a *App) markNotificationJobFailed(
 			 SET is_subscribed = FALSE,
 			     cron_claimed_until = NULL,
 			     delivery_suspended_until = NULL
-			 WHERE chat_id = $1`,
+			 WHERE chat_id = $1 AND $2 <> 'price_alert'`,
 			job.ChatID,
+			job.Kind,
 		); err != nil {
 			appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_failed", "error").Inc()
 			return err
@@ -722,9 +740,10 @@ func (a *App) markNotificationJobFailed(
 			`UPDATE subscribers
 			 SET cron_claimed_until = NULL,
 			     delivery_suspended_until = NOW() + $2::interval
-			 WHERE chat_id = $1`,
+			 WHERE chat_id = $1 AND $3 <> 'price_alert'`,
 			job.ChatID,
 			workers.PostgresInterval(workers.NotificationFailureCooldown),
+			job.Kind,
 		); err != nil {
 			appmetrics.DBOperationsTotal.WithLabelValues("mark_notification_failed", "error").Inc()
 			return err

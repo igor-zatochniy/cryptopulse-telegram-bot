@@ -144,6 +144,10 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 
 			appmetrics.DBOperationsTotal.WithLabelValues("price_upsert", "success").Inc()
 			appmetrics.BinanceRequestsTotal.WithLabelValues(c.Symbol, "success").Inc()
+			if _, err := a.evaluatePriceAlerts(ctx, c.Symbol, price, fetchedAt); err != nil {
+				appmetrics.DBOperationsTotal.WithLabelValues("evaluate_price_alerts", "error").Inc()
+				slog.Error("failed to evaluate price alerts", "symbol", c.Symbol, "error", err)
+			}
 		}(coin)
 	}
 	wg.Wait()

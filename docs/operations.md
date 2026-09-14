@@ -277,6 +277,44 @@ curl -X POST \
 - `429 Too Many Requests`: rate limit.
 - `500 Internal Server Error`: помилка DB або оновлення cron state.
 
+## Цінові алерти
+
+Міграція `010_add_price_alerts.sql` змінює значення інваріанта «одне активне notification job на чат»:
+тепер він стосується лише `kind = 'scheduled'`; процентний алерт має не більше одного job за `price_alert_id`.
+Старий binary не розрізняє типи повідомлень. Самого `DEFAULT 'scheduled'` недостатньо для безпечного rolling deployment.
+
+Перший deployment:
+
+1. Зробіть backup і перевірте міграцію на його тимчасовій копії.
+2. Залиште `PRICE_ALERTS_ENABLED=false` та оновіть усі replicas на новий commit. Startup застосує міграцію 010.
+3. Перевірте `/ready`, CI, звичайні `/subscribe`, `/interval`, `/unsubscribe` та планову доставку.
+4. Лише коли старих replicas немає, задайте `PRICE_ALERTS_ENABLED=true` і виконайте redeploy тієї самої версії.
+5. Перевірте `/alerts`, створення, список і скасування в окремому тестовому чаті. Не змінюйте production-ціни для smoke test.
+
+Перевірка черги без розкриття chat IDs:
+
+```sql
+SELECT kind, status, COUNT(*) FROM notification_jobs GROUP BY kind, status ORDER BY kind, status;
+SELECT status, COUNT(*) FROM price_alerts GROUP BY status ORDER BY status;
+```
+
+Прапорець `false` зупиняє лише створення й перевірку порогів: уже створені jobs продовжують доставлятися,
+а список і скасування через `/alerts` працюють. Активні пороги не змінюються, але пропущені котирування не відтворюються.
+При повторному ввімкненні перевіряється наступна свіжа котировка.
+
+Перед поверненням до binary, що не підтримує алерти: вимкніть прапорець на всіх replicas, дочекайтеся
+завершення старих evaluator-ів, дайте новим workers обробити чергу або явно скасуйте алерти в меню.
+Переконайтеся, що запит нижче повертає `0`, і лише тоді перемикайте код:
+
+```sql
+SELECT COUNT(*) FROM notification_jobs WHERE kind = 'price_alert' AND status IN ('pending', 'sending');
+```
+
+Для code rollback залишайте additive schema на місці. `goose down` для 010 навмисно відмовляється видаляти
+схему, якщо є дані алертів; не обходьте цю перевірку і не видаляйте історію без окремого рішення та backup.
+Звичайна історія notification jobs очищається за наявними retention-правилами; завершені price alerts
+видаляються через 90 днів лише за відсутності пов'язаних jobs. Активні алерти автоматично не видаляються.
+
 ## Metrics
 
 Metrics endpoint потребує Bearer token:

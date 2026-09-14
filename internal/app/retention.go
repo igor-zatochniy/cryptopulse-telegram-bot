@@ -46,7 +46,12 @@ func (a *App) runNotificationRetentionCleanup(ctx context.Context) {
 		slog.Error("failed to clean Telegram reply outbox history", "deleted", deletedReplies, "error", err)
 	}
 
-	if deletedJobs > 0 || deletedUpdates > 0 || deletedReplies > 0 {
+	deletedAlerts, err := a.cleanupPriceAlertHistory(cleanupCtx)
+	if err != nil {
+		slog.Error("failed to clean price alert history", "deleted", deletedAlerts, "error", err)
+	}
+
+	if deletedJobs > 0 || deletedUpdates > 0 || deletedReplies > 0 || deletedAlerts > 0 {
 		slog.Info(
 			"delivery history cleaned",
 			"notification_jobs",
@@ -55,8 +60,25 @@ func (a *App) runNotificationRetentionCleanup(ctx context.Context) {
 			deletedUpdates,
 			"telegram_replies",
 			deletedReplies,
+			"price_alerts",
+			deletedAlerts,
 		)
 	}
+}
+
+func (a *App) cleanupPriceAlertHistory(ctx context.Context) (int64, error) {
+	return drainRetentionBatches(ctx, "price_alert_retention_cleanup", func(dbCtx context.Context) (int64, error) {
+		result, err := a.db.ExecContext(dbCtx, `WITH expired AS (
+			SELECT pa.id FROM price_alerts AS pa
+			WHERE pa.status IN ('triggered', 'canceled') AND pa.updated_at < NOW() - INTERVAL '90 days'
+			AND NOT EXISTS (SELECT 1 FROM notification_jobs WHERE price_alert_id = pa.id)
+			ORDER BY pa.updated_at, pa.id LIMIT $1
+		) DELETE FROM price_alerts USING expired WHERE price_alerts.id = expired.id`, workers.RetentionCleanupLimit)
+		if err != nil {
+			return 0, err
+		}
+		return result.RowsAffected()
+	})
 }
 
 func (a *App) cleanupNotificationJobHistory(ctx context.Context) (int64, error) {

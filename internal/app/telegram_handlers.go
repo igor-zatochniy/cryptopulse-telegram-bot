@@ -74,6 +74,9 @@ func (a *App) processTelegramUpdateWithDB(
 		}
 
 		lang := a.getLangWithDB(ctx, db, chatID)
+		if strings.HasPrefix(data, "alerts_") {
+			return a.handlePriceAlertCallback(ctx, db, update, lang)
+		}
 
 		if strings.HasPrefix(data, "int_") {
 			minutes, err := strconv.Atoi(data[4:])
@@ -172,8 +175,13 @@ func (a *App) processTelegramUpdateWithDB(
 	}
 
 	switch cmd {
+	case "alerts", "allerts":
+		return a.handlePriceAlertCommand(ctx, db, update, lang)
 	case "start":
 		a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "welcome"), nil)
+		if a.priceAlertsEnabled {
+			a.sendSafeMessage(ctx, chatID, apptelegram.AlertText(lang, "menu"), apptelegram.AlertsKeyboard(lang))
+		}
 	case "language":
 		a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "lang_sel"), apptelegram.LanguageKeyboard())
 	case "subscribe":
@@ -201,6 +209,9 @@ func (a *App) processTelegramUpdateWithDB(
 		}
 		appmetrics.DBOperationsTotal.WithLabelValues("unsubscribe", "success").Inc()
 		a.sendSafeMessage(ctx, chatID, apptelegram.Text(lang, "unsubscribe"), nil)
+		if a.priceAlertsEnabled {
+			a.sendSafeMessage(ctx, chatID, apptelegram.AlertText(lang, "independent"), nil)
+		}
 	case "interval":
 		subscribed, err := a.isSubscribedWithDB(ctx, db, chatID)
 		if err != nil {
@@ -246,6 +257,7 @@ func (a *App) unsubscribe(ctx context.Context, db databaseExecutor, chatID int64
 		     last_error = 'subscription canceled',
 		     updated_at = NOW()
 		 WHERE chat_id = $1
+		 AND kind = 'scheduled'
 		 AND status IN ('pending', 'sending')`,
 		chatID,
 	); err != nil {

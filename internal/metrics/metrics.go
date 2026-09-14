@@ -29,6 +29,13 @@ var (
 		},
 		[]string{"status"},
 	)
+	PriceAlertDeliveriesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cryptopulse_price_alert_deliveries_total",
+			Help: "Total number of one-shot price alert delivery attempts by result status.",
+		},
+		[]string{"status"},
+	)
 	WebhookUpdatesTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "cryptopulse_webhook_updates_total",
