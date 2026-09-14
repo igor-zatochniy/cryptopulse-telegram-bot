@@ -18,7 +18,7 @@ func (a *App) syncPriceAlertMenu(ctx context.Context) {
 		{"", "Зростання або падіння ціни на X%"},
 		{"uk", "Зростання або падіння ціни на X%"},
 		{"en", "Price rise or fall by X%"},
-		{"ru", "Рост или падение цены на X%"},
+		{"ru", "Зростання або падіння ціни на X%"},
 	} {
 		if ctx.Err() != nil {
 			return
