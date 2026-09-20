@@ -22,6 +22,12 @@ const (
 
 var alertPercentPattern = regexp.MustCompile(`^[+-]?[0-9]{1,4}([.,][0-9]{1,2})?%?$`)
 
+// Обидві часові межі походять із PostgreSQL, незалежно від годинника replica.
+type priceObservation struct {
+	StartedAt time.Time
+	StoredAt  time.Time
+}
+
 type priceAlert struct {
 	ID       int64
 	ChatID   int64
@@ -74,8 +80,7 @@ func alertTarget(base, percent float64) (float64, error) {
 
 func (a *App) createPriceAlert(ctx context.Context, db databaseExecutor, updateID, chatID int64, lang, symbol string, percent float64) (priceAlert, string, error) {
 	entry, ok := a.priceCache.Load(symbol)
-	if !ok || entry.UpdatedAt.IsZero() || entry.UpdatedAt.After(time.Now().UTC()) ||
-		priceAge(time.Now().UTC(), entry.UpdatedAt) > priceFreshnessLimit {
+	if !ok || entry.UpdatedAt.IsZero() {
 		return priceAlert{}, "stale", nil
 	}
 	target, err := alertTarget(entry.Current, percent)
@@ -85,19 +90,23 @@ func (a *App) createPriceAlert(ctx context.Context, db databaseExecutor, updateI
 
 	// Inbox утримує chat lock: перевірка ліміту й INSERT серіалізовані між replicas.
 	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM price_alerts AS pa
+	var databaseNow time.Time
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), clock_timestamp() FROM price_alerts AS pa
 		WHERE pa.chat_id = $1 AND (pa.status = 'active' OR EXISTS (
 			SELECT 1 FROM notification_jobs WHERE price_alert_id = pa.id AND status IN ('pending', 'sending')
-		))`, chatID).Scan(&count); err != nil {
+		))`, chatID).Scan(&count, &databaseNow); err != nil {
 		return priceAlert{}, "", err
+	}
+	if entry.UpdatedAt.After(databaseNow) || priceAge(databaseNow, entry.UpdatedAt) > priceFreshnessLimit {
+		return priceAlert{}, "stale", nil
 	}
 	if count >= maxActivePriceAlerts {
 		return priceAlert{}, "limit", nil
 	}
 	alert := priceAlert{ChatID: chatID, Symbol: symbol, Lang: lang, Percent: percent, Base: entry.Current, BaseAt: entry.UpdatedAt, Target: target}
 	err = db.QueryRowContext(ctx, `INSERT INTO price_alerts
-		(chat_id, source_update_id, symbol, language_code, change_percent, base_price, base_price_at, target_price)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		(chat_id, source_update_id, symbol, language_code, change_percent, base_price, base_price_at, target_price, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())
 		ON CONFLICT DO NOTHING RETURNING id`, chatID, updateID, symbol, lang, percent, entry.Current, entry.UpdatedAt, target).Scan(&alert.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return priceAlert{}, "duplicate", nil
@@ -155,23 +164,25 @@ func (a *App) notificationEnabled(ctx context.Context, job NotificationJob) (boo
 	return enabled, err
 }
 
-func (a *App) evaluatePriceAlerts(ctx context.Context, symbol string, price float64, fetchedAt time.Time) (int, error) {
+func (a *App) evaluatePriceAlerts(ctx context.Context, symbol string, price float64, observation priceObservation) (int, error) {
 	if !a.priceAlertsEnabled {
 		return 0, nil
 	}
 	if _, ok := alertSymbol(symbol); !ok {
 		return 0, nil
 	}
-	if !isValidMarketPrice(price) || fetchedAt.IsZero() || fetchedAt.After(time.Now().UTC()) ||
-		priceAge(time.Now().UTC(), fetchedAt) > priceFreshnessLimit {
+	if !isValidMarketPrice(price) || observation.StartedAt.IsZero() || observation.StoredAt.IsZero() ||
+		observation.StoredAt.Before(observation.StartedAt) {
 		return 0, errors.New("cannot evaluate alerts with an invalid or stale quote")
 	}
 	dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	rows, err := a.db.QueryContext(dbCtx, `SELECT id, chat_id FROM price_alerts WHERE symbol = $1
-		AND status = 'active' AND created_at <= $3 AND base_price_at <= $3
+		AND status = 'active' AND created_at < $3 AND base_price_at <= $3
+		AND $3 >= clock_timestamp() - ($6 * INTERVAL '1 second') AND $4 <= clock_timestamp()
 		AND ((change_percent > 0 AND target_price <= $2) OR (change_percent < 0 AND target_price >= $2))
-		ORDER BY id LIMIT $4`, symbol, price, fetchedAt, priceAlertBatchLimit)
+		ORDER BY id LIMIT $5`, symbol, price, observation.StartedAt, observation.StoredAt,
+		priceAlertBatchLimit, priceFreshnessLimit.Seconds())
 	if err != nil {
 		return 0, err
 	}
@@ -191,7 +202,7 @@ func (a *App) evaluatePriceAlerts(ctx context.Context, symbol string, price floa
 	}
 	created := 0
 	for _, candidate := range candidates {
-		triggered, err := a.triggerPriceAlert(dbCtx, candidate, price, fetchedAt)
+		triggered, err := a.triggerPriceAlert(dbCtx, candidate, price, observation.StoredAt)
 		if err != nil {
 			return created, err
 		}

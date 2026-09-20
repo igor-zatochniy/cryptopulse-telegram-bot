@@ -46,18 +46,22 @@ func TestAlertTargets(t *testing.T) {
 
 func TestPriceAlertEvaluatorRejectsInvalidQuoteBeforeDatabase(t *testing.T) {
 	a := &App{priceAlertsEnabled: true}
+	now := time.Now()
+	valid := priceObservation{StartedAt: now, StoredAt: now}
 	for _, price := range []float64{math.NaN(), math.Inf(1), 0, -1} {
-		if _, err := a.evaluatePriceAlerts(context.Background(), "BTCUSDT", price, time.Now().UTC()); err == nil {
+		if _, err := a.evaluatePriceAlerts(context.Background(), "BTCUSDT", price, valid); err == nil {
 			t.Errorf("accepted invalid quote %v", price)
 		}
 	}
-	for _, at := range []time.Time{{}, time.Now().Add(-2 * time.Minute), time.Now().Add(time.Minute)} {
-		if _, err := a.evaluatePriceAlerts(context.Background(), "BTCUSDT", 100, at); err == nil {
-			t.Errorf("accepted quote timestamp %v", at)
+	for _, observation := range []priceObservation{
+		{}, {StartedAt: now}, {StoredAt: now}, {StartedAt: now, StoredAt: now.Add(-time.Second)},
+	} {
+		if _, err := a.evaluatePriceAlerts(context.Background(), "BTCUSDT", 100, observation); err == nil {
+			t.Errorf("accepted quote timestamps %v", observation)
 		}
 	}
 	a.priceAlertsEnabled = false
-	if count, err := a.evaluatePriceAlerts(context.Background(), "BTCUSDT", 105, time.Now()); count != 0 || err != nil {
+	if count, err := a.evaluatePriceAlerts(context.Background(), "BTCUSDT", 105, valid); count != 0 || err != nil {
 		t.Fatalf("disabled evaluator = %d, %v", count, err)
 	}
 }

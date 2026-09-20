@@ -404,8 +404,12 @@ func newIntegrationApp(t *testing.T, db *sql.DB, bot *tgbotapi.BotAPI) *App {
 		metricsSecret: "metrics-secret",
 	}
 
+	var databaseNow time.Time
+	if err := db.QueryRow(`SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		t.Fatal(err)
+	}
 	for _, coin := range trackedCoins {
-		app.priceCache.Store(coin.Symbol, 100)
+		app.priceCache.StoreAt(coin.Symbol, 100, databaseNow)
 	}
 
 	return app

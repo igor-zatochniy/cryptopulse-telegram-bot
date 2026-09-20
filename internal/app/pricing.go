@@ -40,6 +40,15 @@ func (a *App) startPriceTicker(ctx context.Context) {
 }
 
 func (a *App) fetchAndCachePrices(ctx context.Context) {
+	var observationStartedAt time.Time
+	if a.priceAlertsEnabled {
+		var err error
+		observationStartedAt, err = a.beginPriceObservation(ctx)
+		if err != nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("price_observation_start", "error").Inc()
+			slog.Error("failed to start price alert observation", "error", err)
+		}
+	}
 	var wg sync.WaitGroup
 	for _, coin := range trackedCoins {
 		wg.Add(1)
@@ -115,21 +124,7 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 				return
 			}
 
-			fetchedAt := time.Now().UTC()
-			a.priceCache.StoreAt(c.Symbol, price, fetchedAt)
-
-			dbCtx, dbCancel := context.WithTimeout(ctx, 2*time.Second)
-			_, err = a.db.ExecContext(
-				dbCtx,
-				`INSERT INTO market_prices (symbol, price, updated_at) VALUES ($1, $2, $3)
-				 ON CONFLICT (symbol) DO UPDATE
-				 SET price = EXCLUDED.price, updated_at = EXCLUDED.updated_at`,
-				c.Symbol,
-				price,
-				fetchedAt,
-			)
-			dbCancel()
-
+			storedAt, err := a.persistMarketPrice(ctx, c.Symbol, price)
 			if err != nil {
 				appmetrics.DBOperationsTotal.WithLabelValues("price_upsert", "error").Inc()
 				slog.Error(
@@ -144,7 +139,12 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 
 			appmetrics.DBOperationsTotal.WithLabelValues("price_upsert", "success").Inc()
 			appmetrics.BinanceRequestsTotal.WithLabelValues(c.Symbol, "success").Inc()
-			if _, err := a.evaluatePriceAlerts(ctx, c.Symbol, price, fetchedAt); err != nil {
+			a.priceCache.StoreAt(c.Symbol, price, storedAt)
+			if observationStartedAt.IsZero() {
+				return
+			}
+			observation := priceObservation{StartedAt: observationStartedAt, StoredAt: storedAt}
+			if _, err := a.evaluatePriceAlerts(ctx, c.Symbol, price, observation); err != nil {
 				appmetrics.DBOperationsTotal.WithLabelValues("evaluate_price_alerts", "error").Inc()
 				slog.Error("failed to evaluate price alerts", "symbol", c.Symbol, "error", err)
 			}
@@ -152,6 +152,31 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 	}
 	wg.Wait()
 	a.observePriceAges(time.Now().UTC())
+}
+
+// Межу спостереження беремо з БД до HTTP-запитів, а не після затриманого запису ціни.
+func (a *App) beginPriceObservation(ctx context.Context) (time.Time, error) {
+	dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var startedAt time.Time
+	if err := a.db.QueryRowContext(dbCtx, `SELECT clock_timestamp()`).Scan(&startedAt); err != nil {
+		return time.Time{}, err
+	}
+	return startedAt, nil
+}
+
+func (a *App) persistMarketPrice(ctx context.Context, symbol string, price float64) (time.Time, error) {
+	if !isValidMarketPrice(price) {
+		return time.Time{}, errors.New("cannot persist invalid market price")
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var storedAt time.Time
+	err := a.db.QueryRowContext(dbCtx,
+		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ($1, $2, clock_timestamp())
+		 ON CONFLICT (symbol) DO UPDATE SET price = EXCLUDED.price, updated_at = clock_timestamp()
+		 RETURNING updated_at`, symbol, price).Scan(&storedAt)
+	return storedAt, err
 }
 
 func parseMarketPrice(raw string) (float64, error) {

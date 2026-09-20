@@ -49,6 +49,19 @@ func assertSQLCount(t *testing.T, db *sql.DB, want int, query string, args ...an
 	}
 }
 
+func evaluatePriceAlertQuoteForTest(a *App, symbol string, price float64) (int, error) {
+	ctx := context.Background()
+	startedAt, err := a.beginPriceObservation(ctx)
+	if err != nil {
+		return 0, err
+	}
+	storedAt, err := a.persistMarketPrice(ctx, symbol, price)
+	if err != nil {
+		return 0, err
+	}
+	return a.evaluatePriceAlerts(ctx, symbol, price, priceObservation{StartedAt: startedAt, StoredAt: storedAt})
+}
+
 func TestIntegrationPriceAlertCreationIsAtomicAndDeduplicated(t *testing.T) {
 	db := setupIntegrationDB(t)
 	app := newIntegrationApp(t, db, newFakeTelegramBot(t, nil))
@@ -81,13 +94,13 @@ func TestIntegrationPriceAlertThresholdsAreOneShotAcrossReplicas(t *testing.T) {
 	app.priceAlertsEnabled, other.priceAlertsEnabled = true, true
 	processAlertCommandForTest(t, app, 80101, 801, "/alerts BTC +5")
 	processAlertCommandForTest(t, app, 80102, 801, "/alerts BTC -5")
-	if n, err := app.evaluatePriceAlerts(context.Background(), "BTCUSDT", 104.99, time.Now().UTC()); n != 0 || err != nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 104.99); n != 0 || err != nil {
 		t.Fatalf("early trigger=%d, %v", n, err)
 	}
 	results := make(chan error, 2)
 	for _, replica := range []*App{app, other} {
 		go func(a *App) {
-			_, err := a.evaluatePriceAlerts(context.Background(), "BTCUSDT", 105, time.Now().UTC())
+			_, err := evaluatePriceAlertQuoteForTest(a, "BTCUSDT", 105)
 			results <- err
 		}(replica)
 	}
@@ -97,10 +110,10 @@ func TestIntegrationPriceAlertThresholdsAreOneShotAcrossReplicas(t *testing.T) {
 		}
 	}
 	assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM notification_jobs WHERE kind = 'price_alert'`)
-	if n, err := app.evaluatePriceAlerts(context.Background(), "BTCUSDT", 95, time.Now().UTC()); n != 1 || err != nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 95); n != 1 || err != nil {
 		t.Fatalf("fall trigger=%d, %v", n, err)
 	}
-	if n, err := app.evaluatePriceAlerts(context.Background(), "BTCUSDT", 120, time.Now().UTC()); n != 0 || err != nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 120); n != 0 || err != nil {
 		t.Fatalf("repeated trigger=%d, %v", n, err)
 	}
 	assertSQLCount(t, db, 2, `SELECT COUNT(*) FROM notification_jobs WHERE kind = 'price_alert'`)
@@ -113,13 +126,13 @@ func TestIntegrationPriceAlertTriggerRollsBackWhenEnqueueFails(t *testing.T) {
 	app.priceAlertsEnabled = true
 	processAlertCommandForTest(t, app, 80201, 802, "/alerts ETH +5")
 	requireSQL(t, db, `ALTER TABLE notification_jobs ADD CONSTRAINT reject_price_alert_job CHECK (kind <> 'price_alert')`)
-	if _, err := app.evaluatePriceAlerts(context.Background(), "ETHUSDT", 106, time.Now().UTC()); err == nil {
+	if _, err := evaluatePriceAlertQuoteForTest(app, "ETHUSDT", 106); err == nil {
 		t.Fatal("expected enqueue error")
 	}
 	assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM price_alerts WHERE status = 'active' AND trigger_price IS NULL`)
 	assertSQLCount(t, db, 0, `SELECT COUNT(*) FROM notification_jobs`)
 	requireSQL(t, db, `ALTER TABLE notification_jobs DROP CONSTRAINT reject_price_alert_job`)
-	if n, err := app.evaluatePriceAlerts(context.Background(), "ETHUSDT", 106, time.Now().UTC()); n != 1 || err != nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "ETHUSDT", 106); n != 1 || err != nil {
 		t.Fatalf("enqueue after recovery=%d, %v", n, err)
 	}
 }
@@ -132,7 +145,7 @@ func TestIntegrationPriceAlertDeliveryDoesNotChangeScheduledCadence(t *testing.T
 	old := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
 	insertSubscriber(t, db, 803, true, 1, "ua", old)
 	processAlertCommandForTest(t, app, 80301, 803, "/alerts SOL +10")
-	if n, err := app.evaluatePriceAlerts(context.Background(), "SOLUSDT", 110, time.Now().UTC()); n != 1 || err != nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "SOLUSDT", 110); n != 1 || err != nil {
 		t.Fatalf("trigger=%d, %v", n, err)
 	}
 	if n, err := app.createCronNotificationJobs(context.Background()); n != 1 || err != nil {
@@ -167,7 +180,7 @@ func TestIntegrationPriceAlertUnsubscribeAndCancelIsolation(t *testing.T) {
 	app.priceAlertsEnabled = true
 	insertSubscriber(t, db, 804, true, 1, "ua", time.Now().Add(-time.Hour))
 	processAlertCommandForTest(t, app, 80401, 804, "/alerts BNB -5")
-	if _, err := app.evaluatePriceAlerts(context.Background(), "BNBUSDT", 95, time.Now().UTC()); err != nil {
+	if _, err := evaluatePriceAlertQuoteForTest(app, "BNBUSDT", 95); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := app.createCronNotificationJobs(context.Background()); err != nil {
@@ -189,7 +202,7 @@ func TestIntegrationPriceAlertUnsubscribeAndCancelIsolation(t *testing.T) {
 
 	app.priceAlertsEnabled = true
 	processAlertCommandForTest(t, app, 80403, 804, "/alerts ETH +5")
-	if _, err := app.evaluatePriceAlerts(context.Background(), "ETHUSDT", 105, time.Now().UTC()); err != nil {
+	if _, err := evaluatePriceAlertQuoteForTest(app, "ETHUSDT", 105); err != nil {
 		t.Fatal(err)
 	}
 	job, err = app.claimPendingNotificationJob(context.Background())
@@ -227,7 +240,7 @@ func TestIntegrationPriceAlertFailuresPreserveSubscriberState(t *testing.T) {
 			insertSubscriber(t, db, 805, true, 1, "ua", old)
 			requireSQL(t, db, `UPDATE subscribers SET cron_claimed_until = NOW() + INTERVAL '15 minutes', delivery_suspended_until = NOW() + INTERVAL '1 hour'`)
 			processAlertCommandForTest(t, app, 80501, 805, "/alerts BTC +5")
-			if _, err := app.evaluatePriceAlerts(context.Background(), "BTCUSDT", 105, time.Now().UTC()); err != nil {
+			if _, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 105); err != nil {
 				t.Fatal(err)
 			}
 			for attempt := 1; attempt <= workers.NotificationJobMaxAttempts; attempt++ {
@@ -246,7 +259,7 @@ func TestIntegrationPriceAlertFailuresPreserveSubscriberState(t *testing.T) {
 				requireSQL(t, db, `UPDATE notification_jobs SET next_attempt_at = NOW()`)
 			}
 			assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM notification_jobs WHERE status = 'failed'`)
-			if n, err := app.evaluatePriceAlerts(context.Background(), "BTCUSDT", 110, time.Now().UTC()); n != 0 || err != nil {
+			if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 110); n != 0 || err != nil {
 				t.Fatalf("exhausted alert was recreated: %d, %v", n, err)
 			}
 		})
@@ -262,12 +275,16 @@ func TestIntegrationPriceAlertValidationLimitsAndRetention(t *testing.T) {
 	app.priceCache.StoreAt("BTCUSDT", 100, time.Now().Add(-2*time.Minute))
 	processAlertCommandForTest(t, app, 80601, 806, "/alerts BTC +5")
 	assertSQLCount(t, db, 0, `SELECT COUNT(*) FROM price_alerts`)
-	app.priceCache.Store("BTCUSDT", 100)
+	baseAt, err := app.beginPriceObservation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.priceCache.StoreAt("BTCUSDT", 100, baseAt)
 	for i := 1; i <= 11; i++ {
 		processAlertCommandForTest(t, app, 80610+i, 806, fmt.Sprintf("/alerts BTC +%d", i))
 	}
 	assertSQLCount(t, db, 10, `SELECT COUNT(*) FROM price_alerts WHERE status = 'active'`)
-	if n, err := app.evaluatePriceAlerts(context.Background(), "BTCUSDT", 120, time.Now().UTC()); n != 10 || err != nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 120); n != 10 || err != nil {
 		t.Fatalf("batch trigger=%d, %v", n, err)
 	}
 	processAlertCommandForTest(t, app, 80650, 806, "/alerts ETH +5")
@@ -325,7 +342,7 @@ func TestIntegrationPriceAlertRetryRecoversWithoutSubscription(t *testing.T) {
 	app := newIntegrationApp(t, db, bot)
 	app.priceAlertsEnabled = true
 	processAlertCommandForTest(t, app, 80801, 808, "/alerts ETH -5")
-	if _, err := app.evaluatePriceAlerts(context.Background(), "ETHUSDT", 95, time.Now().UTC()); err != nil {
+	if _, err := evaluatePriceAlertQuoteForTest(app, "ETHUSDT", 95); err != nil {
 		t.Fatal(err)
 	}
 	job, err := app.claimPendingNotificationJob(context.Background())
@@ -432,14 +449,14 @@ func TestIntegrationPriceAlertBatchKeepsCommittedProgress(t *testing.T) {
 	processAlertCommandForTest(t, app, 81002, 811, "/alerts BTC +5")
 	insertSubscriber(t, db, 810, false, 60, "en", time.Now())
 	requireSQL(t, db, `ALTER TABLE notification_jobs ADD CONSTRAINT reject_second_alert CHECK (chat_id <> 811)`)
-	if n, err := app.evaluatePriceAlerts(context.Background(), "BTCUSDT", 105, time.Now().UTC()); n != 1 || err == nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 105); n != 1 || err == nil {
 		t.Fatalf("partial progress=%d, %v; want one commit followed by failure", n, err)
 	}
 	assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM price_alerts WHERE chat_id = 810 AND status = 'triggered'`)
 	assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM price_alerts WHERE chat_id = 811 AND status = 'active'`)
 	assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM notification_jobs WHERE chat_id = 810 AND language_code = 'en'`)
 	requireSQL(t, db, `ALTER TABLE notification_jobs DROP CONSTRAINT reject_second_alert`)
-	if n, err := app.evaluatePriceAlerts(context.Background(), "BTCUSDT", 105, time.Now().UTC()); n != 1 || err != nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 105); n != 1 || err != nil {
 		t.Fatalf("recovered progress=%d, %v", n, err)
 	}
 	assertSQLCount(t, db, 2, `SELECT COUNT(*) FROM notification_jobs`)
