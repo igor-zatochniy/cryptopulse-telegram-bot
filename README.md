@@ -47,6 +47,9 @@ Production-орієнтований Telegram-сервіс на Go. Він від
 Наприклад, база 60 000 USDT і +5% означають незмінний поріг 63 000 USDT. Кожен алерт спрацьовує один раз.
 Перевірка виконується за успішно отриманими котируваннями у 15-секундному циклі: коротке перетинання між
 опитуваннями або під час недоступності Binance/БД може залишитися непоміченим. Це не моніторинг кожної біржової угоди.
+Перетини вже прийнятого котирування записуються в `price_alert_crossings` у тій самій транзакції, що й ціна.
+Зайнятий chat, межа batch або restart не скасовують цю роботу: наступний цикл обробляє збережений перетин,
+навіть якщо нова ціна вже повернулася нижче/вище порога або Binance тимчасово недоступний.
 
 Порядок створення алерта й спостереження ціни визначає годинник PostgreSQL, а не годинники replicas.
 Алерт перевіряється лише в циклі, розпочатому після його створення; запит, який уже виконувався,
@@ -173,7 +176,7 @@ cp .env.example .env
 | `METRICS_SECRET` | yes | Окремий Bearer secret для `/metrics`; має відрізнятися від `CRON_SECRET`. |
 | `PORT` | no | HTTP port. За замовчуванням `8080`. |
 | `TELEGRAM_UPDATE_WORKERS` | no | Кількість inbox workers від `1` до `4`. За замовчуванням `4`; логічні 64 shards залишаються незмінним форматом даних. |
-| `PRICE_ALERTS_ENABLED` | no | `false` за замовчуванням. `true` дозволяє створення й перевірку цінових алертів; уже створені notification jobs доставляються незалежно від прапорця. |
+| `PRICE_ALERTS_ENABLED` | no | `false` за замовчуванням. `true` дозволяє створення й перевірку цінових алертів; збережені перетини та notification jobs обробляються незалежно від прапорця. |
 
 Ніколи не комітьте реальні `.env` файли або production secrets.
 
@@ -215,6 +218,8 @@ goose -dir migrations postgres "$DATABASE_URL" up
 - `008_add_notification_job_cancellation.sql` додає terminal-статус `canceled` для сповіщень, скасованих після відписки.
 - `009_harden_market_price_constraint.sql` видаляє некоректні legacy-ціни та вимагає додатне скінченне значення для кожної нової ціни.
 - `010_add_price_alerts.sql` додає одноразові цінові алерти та розділяє інваріанти scheduled/price-alert notification jobs.
+- `011_add_price_alert_crossings.sql` зберігає виявлені перетини до створення notification jobs.
+- `012_add_telegram_mutation_versions.sql` додає версії налаштувань і епохи Telegram update IDs.
 
 ## Локальна розробка
 
@@ -325,7 +330,10 @@ curl -H "Authorization: Bearer $METRICS_SECRET" \
 - Duplicate webhook delivery не створює повторну роботу завдяки унікальному `update_id`.
 - Notification workers отримують `claim_token`; stale worker не може завершити job після повторного claim іншим worker.
 - Завершення inbox/outbox job перевіряє поточний claim state, тому stale worker не може перезаписати результат свіжого claim.
-- Для одного Telegram chat зберігається FIFO processing між replicas через SQL claim rule і PostgreSQL advisory lock.
+- Уже збережені updates одного chat обробляються послідовно між replicas через SQL claim rule і PostgreSQL advisory lock.
+- Підписка, інтервал і мова мають окремі версії: запізніла стара команда не перезаписує новіше налаштування. Вона завершується без повторної mutation і без застарілого підтвердження; callback отримує порожній ACK.
+- Після семи днів без нових updates починається нова епоха IDs, тому нові менші Telegram IDs не блокуються старими версіями. Версії попередньої епохи залишаються в БД.
+- Вибір інтервалу не вмикає підписку; передумови перевіряються під час обробки. Відхилений вибір не повторюється автоматично після пізнішого надходження `/subscribe`. Старий callback не змінює інтервал новішої підписки.
 - Мова користувача читається з PostgreSQL під час обробки update, без локального per-replica cache.
 - Telegram sends виконуються поза database transactions.
 - Telegram delivery використовує at-least-once semantics. Після підтвердженого send DB-finalization повторюється до п'яти разів із bounded backoff без повторного Telegram request у межах тієї самої processing attempt. Рідкісний duplicate залишається можливим, якщо process завершується після прийняття message Telegram, але до durable збереження status `sent`.

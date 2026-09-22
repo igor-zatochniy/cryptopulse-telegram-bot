@@ -81,10 +81,11 @@ type NotificationJob struct {
 }
 
 type TelegramUpdateJob struct {
-	UpdateID int64
-	ChatID   int64
-	Payload  string
-	Attempts int
+	UpdateID    int64
+	StreamEpoch int64
+	ChatID      int64
+	Payload     string
+	Attempts    int
 }
 
 type databaseExecutor interface {

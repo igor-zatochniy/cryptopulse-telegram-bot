@@ -4,9 +4,11 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/igor-zatochniy/cryptopulse-telegram-bot/internal/workers"
@@ -43,7 +45,7 @@ func openPool(
 ) (*sql.DB, error) {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("open postgres %s pool: %w", poolName, err)
+		return nil, postgresPoolError("open", poolName, err)
 	}
 
 	db.SetMaxOpenConns(maxOpenConnections)
@@ -55,8 +57,17 @@ func openPool(
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("ping postgres %s pool: %w", poolName, err)
+		return nil, postgresPoolError("ping", poolName, err)
 	}
 
 	return db, nil
+}
+
+func postgresPoolError(operation, poolName string, err error) error {
+	var parseErr *pgconn.ParseConfigError
+	if errors.As(err, &parseErr) {
+		// ParseConfigError містить DSN; навіть її вкладена причина може розкрити пароль.
+		return fmt.Errorf("%s postgres %s pool: invalid PostgreSQL connection configuration", operation, poolName)
+	}
+	return fmt.Errorf("%s postgres %s pool: %w", operation, poolName, err)
 }

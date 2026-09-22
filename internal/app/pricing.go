@@ -40,6 +40,13 @@ func (a *App) startPriceTicker(ctx context.Context) {
 }
 
 func (a *App) fetchAndCachePrices(ctx context.Context) {
+	defer func() {
+		// Уже зафіксовані перетини обробляємо навіть без нових цін або після вимкнення створення alerts.
+		if _, err := a.processPriceAlertCrossings(ctx); err != nil && ctx.Err() == nil {
+			appmetrics.DBOperationsTotal.WithLabelValues("evaluate_price_alerts", "error").Inc()
+			slog.Error("failed to process price alert crossings", "error", err)
+		}
+	}()
 	var observationStartedAt time.Time
 	if a.priceAlertsEnabled {
 		var err error
@@ -47,6 +54,7 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 		if err != nil {
 			appmetrics.DBOperationsTotal.WithLabelValues("price_observation_start", "error").Inc()
 			slog.Error("failed to start price alert observation", "error", err)
+			return
 		}
 	}
 	var wg sync.WaitGroup
@@ -124,7 +132,7 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 				return
 			}
 
-			storedAt, err := a.persistMarketPrice(ctx, c.Symbol, price)
+			storedAt, err := a.persistObservedMarketPrice(ctx, c.Symbol, price, observationStartedAt)
 			if err != nil {
 				appmetrics.DBOperationsTotal.WithLabelValues("price_upsert", "error").Inc()
 				slog.Error(
@@ -140,14 +148,6 @@ func (a *App) fetchAndCachePrices(ctx context.Context) {
 			appmetrics.DBOperationsTotal.WithLabelValues("price_upsert", "success").Inc()
 			appmetrics.BinanceRequestsTotal.WithLabelValues(c.Symbol, "success").Inc()
 			a.priceCache.StoreAt(c.Symbol, price, storedAt)
-			if observationStartedAt.IsZero() {
-				return
-			}
-			observation := priceObservation{StartedAt: observationStartedAt, StoredAt: storedAt}
-			if _, err := a.evaluatePriceAlerts(ctx, c.Symbol, price, observation); err != nil {
-				appmetrics.DBOperationsTotal.WithLabelValues("evaluate_price_alerts", "error").Inc()
-				slog.Error("failed to evaluate price alerts", "symbol", c.Symbol, "error", err)
-			}
 		}(coin)
 	}
 	wg.Wait()
@@ -166,17 +166,38 @@ func (a *App) beginPriceObservation(ctx context.Context) (time.Time, error) {
 }
 
 func (a *App) persistMarketPrice(ctx context.Context, symbol string, price float64) (time.Time, error) {
+	return a.persistObservedMarketPrice(ctx, symbol, price, time.Time{})
+}
+
+func (a *App) persistObservedMarketPrice(ctx context.Context, symbol string, price float64, startedAt time.Time) (time.Time, error) {
 	if !isValidMarketPrice(price) {
 		return time.Time{}, errors.New("cannot persist invalid market price")
 	}
 	dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
+	tx, err := a.db.BeginTx(dbCtx, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var storedAt time.Time
-	err := a.db.QueryRowContext(dbCtx,
+	err = tx.QueryRowContext(dbCtx,
 		`INSERT INTO market_prices (symbol, price, updated_at) VALUES ($1, $2, clock_timestamp())
 		 ON CONFLICT (symbol) DO UPDATE SET price = EXCLUDED.price, updated_at = clock_timestamp()
 		 RETURNING updated_at`, symbol, price).Scan(&storedAt)
-	return storedAt, err
+	if err != nil {
+		return time.Time{}, err
+	}
+	if a.priceAlertsEnabled && !startedAt.IsZero() {
+		// Ціна та обов'язок обробити її перетини фіксуються одним commit.
+		if err := capturePriceAlertCrossings(dbCtx, tx, symbol, price, priceObservation{StartedAt: startedAt, StoredAt: storedAt}); err != nil {
+			return time.Time{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, err
+	}
+	return storedAt, nil
 }
 
 func parseMarketPrice(raw string) (float64, error) {

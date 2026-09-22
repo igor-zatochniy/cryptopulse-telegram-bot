@@ -168,49 +168,83 @@ func (a *App) evaluatePriceAlerts(ctx context.Context, symbol string, price floa
 	if !a.priceAlertsEnabled {
 		return 0, nil
 	}
+	dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := capturePriceAlertCrossings(dbCtx, a.db, symbol, price, observation); err != nil {
+		return 0, err
+	}
+	return a.processPriceAlertCrossings(ctx)
+}
+
+func capturePriceAlertCrossings(ctx context.Context, db databaseExecutor, symbol string, price float64, observation priceObservation) error {
 	if _, ok := alertSymbol(symbol); !ok {
-		return 0, nil
+		return nil
 	}
 	if !isValidMarketPrice(price) || observation.StartedAt.IsZero() || observation.StoredAt.IsZero() ||
 		observation.StoredAt.Before(observation.StartedAt) {
-		return 0, errors.New("cannot evaluate alerts with an invalid or stale quote")
+		return errors.New("cannot evaluate alerts with an invalid or stale quote")
 	}
+	// Не обмежуємо запис перетинів розміром delivery batch і не чекаємо chat lock.
+	_, err := db.ExecContext(ctx, `INSERT INTO price_alert_crossings (alert_id, price, observed_at)
+		SELECT id, $2, $4 FROM price_alerts WHERE symbol = $1
+		AND status = 'active' AND created_at < $3 AND base_price_at <= $3
+		AND $3 >= clock_timestamp() - ($5 * INTERVAL '1 second') AND $4 <= clock_timestamp()
+		AND ((change_percent > 0 AND target_price <= $2) OR (change_percent < 0 AND target_price >= $2))
+		ORDER BY id ON CONFLICT (alert_id) DO NOTHING`, symbol, price,
+		observation.StartedAt, observation.StoredAt, priceFreshnessLimit.Seconds())
+	return err
+}
+
+func (a *App) processPriceAlertCrossings(ctx context.Context) (int, error) {
 	dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	rows, err := a.db.QueryContext(dbCtx, `SELECT id, chat_id FROM price_alerts WHERE symbol = $1
-		AND status = 'active' AND created_at < $3 AND base_price_at <= $3
-		AND $3 >= clock_timestamp() - ($6 * INTERVAL '1 second') AND $4 <= clock_timestamp()
-		AND ((change_percent > 0 AND target_price <= $2) OR (change_percent < 0 AND target_price >= $2))
-		ORDER BY id LIMIT $5`, symbol, price, observation.StartedAt, observation.StoredAt,
-		priceAlertBatchLimit, priceFreshnessLimit.Seconds())
-	if err != nil {
-		return 0, err
-	}
-	var candidates []priceAlert
-	for rows.Next() {
-		var candidate priceAlert
-		if err := rows.Scan(&candidate.ID, &candidate.ChatID); err != nil {
-			_ = rows.Close()
-			return 0, err
-		}
-		candidates = append(candidates, candidate)
-	}
-	err = rows.Err()
-	_ = rows.Close()
-	if err != nil {
+	if _, err := a.db.ExecContext(dbCtx, `DELETE FROM price_alert_crossings AS pc
+		USING price_alerts AS pa WHERE pa.id = pc.alert_id AND pa.status <> 'active'`); err != nil {
 		return 0, err
 	}
 	created := 0
-	for _, candidate := range candidates {
-		triggered, err := a.triggerPriceAlert(dbCtx, candidate, price, observation.StoredAt)
+	var afterID int64
+	for {
+		rows, err := a.db.QueryContext(dbCtx, `SELECT pa.id, pa.chat_id, pc.price, pc.observed_at
+			FROM price_alert_crossings AS pc JOIN price_alerts AS pa ON pa.id = pc.alert_id
+			WHERE pa.status = 'active' AND pa.id > $1 ORDER BY pa.id LIMIT $2`, afterID, priceAlertBatchLimit)
 		if err != nil {
 			return created, err
 		}
-		if triggered {
-			created++
+		type crossing struct {
+			alert priceAlert
+			price float64
+			at    time.Time
+		}
+		var candidates []crossing
+		for rows.Next() {
+			var candidate crossing
+			if err := rows.Scan(&candidate.alert.ID, &candidate.alert.ChatID, &candidate.price, &candidate.at); err != nil {
+				_ = rows.Close()
+				return created, err
+			}
+			candidates = append(candidates, candidate)
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return created, err
+		}
+		if len(candidates) == 0 {
+			return created, nil
+		}
+		for _, candidate := range candidates {
+			triggered, err := a.triggerPriceAlert(dbCtx, candidate.alert, candidate.price, candidate.at)
+			if err != nil {
+				return created, err
+			}
+			if triggered {
+				created++
+			}
+			// Зайняті chats не блокують наступну пачку; їхні rows залишаються для повтору.
+			afterID = candidate.alert.ID
 		}
 	}
-	return created, nil
 }
 
 // Кожне спрацювання фіксується окремо: timeout пачки не скасовує вже створені jobs.
@@ -245,6 +279,9 @@ func (a *App) triggerPriceAlert(ctx context.Context, candidate priceAlert, price
 		(chat_id, language_code, message_text, scheduled_at, next_attempt_at, kind, price_alert_id)
 		VALUES ($1, $2, $3, $4, NOW(), 'price_alert', $5)`,
 		alert.ChatID, alert.Lang, text, fetchedAt, alert.ID); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM price_alert_crossings WHERE alert_id = $1`, alert.ID); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

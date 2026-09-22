@@ -14,18 +14,22 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 	defer cancel()
 
 	var (
-		subscribersTable       bool
-		marketPricesTable      bool
-		notificationJobsTable  bool
-		telegramUpdatesTable   bool
-		telegramRepliesTable   bool
-		deliveryCooldownColumn bool
-		jobClaimTokenColumn    bool
-		jobCanceledAtColumn    bool
-		updateShardColumn      bool
-		marketPriceConstraint  bool
-		priceAlertsTable       bool
-		priceAlertJobsIndex    bool
+		subscribersTable              bool
+		marketPricesTable             bool
+		notificationJobsTable         bool
+		telegramUpdatesTable          bool
+		telegramRepliesTable          bool
+		deliveryCooldownColumn        bool
+		jobClaimTokenColumn           bool
+		jobCanceledAtColumn           bool
+		updateShardColumn             bool
+		marketPriceConstraint         bool
+		priceAlertsTable              bool
+		priceAlertJobsIndex           bool
+		priceAlertCrossingsTable      bool
+		telegramMutationVersionsTable bool
+		telegramUpdateStreamTable     bool
+		updateEpochColumn             bool
 	)
 
 	err := db.QueryRowContext(checkCtx, `SELECT
@@ -36,6 +40,11 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		to_regclass('public.telegram_replies') IS NOT NULL,
 		to_regclass('public.price_alerts') IS NOT NULL,
 		to_regclass('public.notification_jobs_one_per_price_alert') IS NOT NULL,
+		to_regclass('public.price_alert_crossings') IS NOT NULL,
+		to_regclass('public.telegram_mutation_versions') IS NOT NULL,
+		to_regclass('public.telegram_update_stream') IS NOT NULL,
+		EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public'
+			AND table_name = 'telegram_updates' AND column_name = 'stream_epoch'),
 		EXISTS (
 			SELECT 1
 			FROM information_schema.columns
@@ -77,6 +86,10 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		&telegramRepliesTable,
 		&priceAlertsTable,
 		&priceAlertJobsIndex,
+		&priceAlertCrossingsTable,
+		&telegramMutationVersionsTable,
+		&telegramUpdateStreamTable,
+		&updateEpochColumn,
 		&deliveryCooldownColumn,
 		&jobClaimTokenColumn,
 		&jobCanceledAtColumn,
@@ -97,6 +110,10 @@ func VerifySchema(ctx context.Context, db *sql.DB) error {
 		{"table telegram_updates", telegramUpdatesTable},
 		{"table telegram_replies", telegramRepliesTable},
 		{"table price_alerts", priceAlertsTable},
+		{"table price_alert_crossings", priceAlertCrossingsTable},
+		{"table telegram_mutation_versions", telegramMutationVersionsTable},
+		{"table telegram_update_stream", telegramUpdateStreamTable},
+		{"column telegram_updates.stream_epoch", updateEpochColumn},
 		{"index notification_jobs_one_per_price_alert", priceAlertJobsIndex},
 		{"column subscribers.delivery_suspended_until", deliveryCooldownColumn},
 		{"column notification_jobs.claim_token", jobClaimTokenColumn},

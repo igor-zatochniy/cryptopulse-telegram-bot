@@ -72,21 +72,35 @@ func (a *App) saveTelegramUpdate(ctx context.Context, update tgbotapi.Update, pa
 	dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer dbCancel()
 
-	result, err := a.db.ExecContext(
+	tx, err := a.db.BeginTx(dbCtx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Telegram може почати нову послідовність IDs після тижня без updates.
+	var epoch int64
+	if err := tx.QueryRowContext(dbCtx, `SELECT epoch + CASE
+		WHEN last_received_at < clock_timestamp() - INTERVAL '7 days' THEN 1 ELSE 0 END
+		FROM telegram_update_stream WHERE singleton = TRUE FOR UPDATE`).Scan(&epoch); err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(
 		dbCtx,
 		`INSERT INTO telegram_updates (
 			update_id,
 			chat_id,
 			shard_id,
+			stream_epoch,
 			payload,
 			status,
 			next_attempt_at
-		) VALUES ($1, $2, $3, $4::jsonb, 'pending', NOW())
+		) VALUES ($1, $2, $3, $5, $4::jsonb, 'pending', NOW())
 		ON CONFLICT (update_id) DO NOTHING`,
 		int64(update.UpdateID),
 		chatID,
 		shardID,
 		string(payload),
+		epoch,
 	)
 	if err != nil {
 		appmetrics.DBOperationsTotal.WithLabelValues("save_telegram_update", "error").Inc()
@@ -99,6 +113,15 @@ func (a *App) saveTelegramUpdate(ctx context.Context, update tgbotapi.Update, pa
 		return false, err
 	}
 
+	if inserted > 0 {
+		if _, err := tx.ExecContext(dbCtx, `UPDATE telegram_update_stream
+			SET epoch = $1, last_received_at = clock_timestamp() WHERE singleton = TRUE`, epoch); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	appmetrics.DBOperationsTotal.WithLabelValues("save_telegram_update", "success").Inc()
 	return inserted > 0, nil
 }
@@ -145,9 +168,9 @@ func (a *App) claimPendingTelegramUpdateForWorker(
 			FROM telegram_updates AS earlier
 			WHERE earlier.chat_id = tu.chat_id
 			AND earlier.status IN ('pending', 'processing')
-			AND earlier.update_id < tu.update_id
+				AND (earlier.stream_epoch, earlier.update_id) < (tu.stream_epoch, tu.update_id)
 		)
-		ORDER BY tu.update_id ASC
+		ORDER BY tu.stream_epoch, tu.update_id ASC
 		LIMIT 1
 		FOR UPDATE OF tu SKIP LOCKED
 	), claimed AS (
@@ -158,9 +181,9 @@ func (a *App) claimPendingTelegramUpdateForWorker(
 		    updated_at = NOW()
 		FROM next_update
 		WHERE tu.update_id = next_update.update_id
-		RETURNING tu.update_id, tu.chat_id, tu.payload::text, tu.attempts
+		RETURNING tu.update_id, tu.chat_id, tu.payload::text, tu.attempts, tu.stream_epoch
 	)
-	SELECT update_id, chat_id, payload, attempts FROM claimed`,
+	SELECT update_id, chat_id, payload, attempts, stream_epoch FROM claimed`,
 		shardIDs,
 		workers.PostgresInterval(workers.TelegramUpdateClaimWindow),
 	).Scan(
@@ -168,6 +191,7 @@ func (a *App) claimPendingTelegramUpdateForWorker(
 		&job.ChatID,
 		&job.Payload,
 		&job.Attempts,
+		&job.StreamEpoch,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -321,6 +345,17 @@ func (a *App) processTelegramUpdateJob(ctx context.Context, job TelegramUpdateJo
 		}()
 
 		processCtx = withTelegramReplyCollector(processCtx, replyCollector)
+		apply, err := allowTelegramMutation(processCtx, tx, job, update)
+		if err != nil {
+			processingErr = err
+			return
+		}
+		if !apply {
+			if update.CallbackQuery != nil {
+				a.acknowledgeCallback(processCtx, update.CallbackQuery.ID)
+			}
+			return
+		}
 		if err := a.processTelegramUpdateWithDB(processCtx, tx, update); err != nil {
 			processingErr = err
 			return

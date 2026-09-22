@@ -392,6 +392,10 @@ func TestIntegrationPriceAlertMigrationUpgradeAndGuardedRollback(t *testing.T) {
 		t.Fatal("rollback discarded live alert data")
 	}
 	assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM price_alerts`)
+	// DownTo застосовує кожну migration окремо; повертаємо вже зняті additive migrations.
+	if _, err := storage.ApplyMigrations(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
 	if err := storage.VerifySchema(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +460,7 @@ func TestIntegrationPriceAlertBatchKeepsCommittedProgress(t *testing.T) {
 	assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM price_alerts WHERE chat_id = 811 AND status = 'active'`)
 	assertSQLCount(t, db, 1, `SELECT COUNT(*) FROM notification_jobs WHERE chat_id = 810 AND language_code = 'en'`)
 	requireSQL(t, db, `ALTER TABLE notification_jobs DROP CONSTRAINT reject_second_alert`)
-	if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 105); n != 1 || err != nil {
+	if n, err := evaluatePriceAlertQuoteForTest(app, "BTCUSDT", 104); n != 1 || err != nil {
 		t.Fatalf("recovered progress=%d, %v", n, err)
 	}
 	assertSQLCount(t, db, 2, `SELECT COUNT(*) FROM notification_jobs`)

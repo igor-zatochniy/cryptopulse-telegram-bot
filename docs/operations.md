@@ -305,7 +305,8 @@ SELECT status, COUNT(*) FROM price_alerts GROUP BY status ORDER BY status;
 Час створення алерта, початку циклу спостереження та запису котирування береться з PostgreSQL.
 Цикл, розпочатий до створення алерта, пропускає його навіть за затримки HTTP-відповіді чи запису в БД;
 перевірка почнеться з наступного циклу. Межа свіжості також перевіряється за часом БД.
-Якщо отримати час початку циклу не вдалося, ціни ще можуть оновитися, але алерти в цьому циклі не обробляються.
+Якщо за ввімкнених алертів отримати час початку циклу не вдалося, нові ціни в цьому циклі не приймаються.
+Уже збережені перетини обробляються незалежно від результату нового запиту Binance та feature flag.
 
 Перед поверненням до binary, що не підтримує алерти: вимкніть прапорець на всіх replicas, дочекайтеся
 завершення старих evaluator-ів, дайте новим workers обробити чергу або явно скасуйте алерти в меню.
@@ -313,12 +314,41 @@ SELECT status, COUNT(*) FROM price_alerts GROUP BY status ORDER BY status;
 
 ```sql
 SELECT COUNT(*) FROM notification_jobs WHERE kind = 'price_alert' AND status IN ('pending', 'sending');
+SELECT COUNT(*) FROM price_alert_crossings;
 ```
 
 Для code rollback залишайте additive schema на місці. `goose down` для 010 навмисно відмовляється видаляти
 схему, якщо є дані алертів; не обходьте цю перевірку і не видаляйте історію без окремого рішення та backup.
 Звичайна історія notification jobs очищається за наявними retention-правилами; завершені price alerts
 видаляються через 90 днів лише за відсутності пов'язаних jobs. Активні алерти автоматично не видаляються.
+
+## Оновлення Durable Crossings І Версій Команд
+
+Міграції 011 і 012 additive та застосовуються до початку serving. Перед deploy перевірте backup і upgrade
+на його ізольованій копії. Не змінюйте вже застосовані migrations і не видаляйте version tables вручну.
+Захист від запізнілих команд діє лише після заміни всіх старих replicas. Для переходу без змішаних workers
+зупиніть старі instances перед запуском нової версії у запланованому вікні; Telegram повторить webhook,
+що не отримав успішного HTTP response. Не видаляйте pending updates. Якщо обрано rolling deployment,
+старі workers до завершення rollout усе ще мають попередню семантику.
+
+`price_alert_crossings` зберігає перший зафіксований перетин кожного alert до атомарного trigger/enqueue.
+Обробка порціями не видаляє залишок після timeout або зайнятого chat. Скасовані alerts не доставляються;
+їхні crossings очищаються наступним циклом. Порожня таблиця означає відсутність цієї відкладеної роботи.
+
+`telegram_mutation_versions` зберігає останню застосовану версію для subscription/interval/language,
+а `telegram_update_stream` визначає епоху після тижня без нових updates. Обидві таблиці входять до backup.
+Не скидайте епоху чи версії для ручного replay; це може дозволити старій команді змінити нове налаштування.
+Міграція 012 відновлює доступні версії з processed inbox rows під час upgrade.
+
+```sql
+SELECT COUNT(*), MIN(observed_at) FROM price_alert_crossings;
+SELECT epoch, last_received_at FROM telegram_update_stream;
+```
+
+Для rollback збережіть additive schema. `goose down` відмовиться видалити непорожні crossings або
+використані версії команд; попередня версія binary не забезпечує нові гарантії ordering/crossing recovery.
+Помилка розбору `DATABASE_URL` навмисно не містить DSN: перевіряйте параметри в secret storage,
+не публікуйте URL чи пароль у deployment logs або повідомленнях підтримки.
 
 ## Metrics
 
