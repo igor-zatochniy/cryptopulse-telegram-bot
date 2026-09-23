@@ -49,6 +49,10 @@ func assertSQLCount(t *testing.T, db *sql.DB, want int, query string, args ...an
 	}
 }
 
+func (a *App) persistMarketPrice(ctx context.Context, symbol string, price float64) (time.Time, error) {
+	return a.persistObservedMarketPrice(ctx, symbol, price, time.Time{})
+}
+
 func evaluatePriceAlertQuoteForTest(a *App, symbol string, price float64) (int, error) {
 	ctx := context.Background()
 	startedAt, err := a.beginPriceObservation(ctx)

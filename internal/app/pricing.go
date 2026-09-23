@@ -165,10 +165,6 @@ func (a *App) beginPriceObservation(ctx context.Context) (time.Time, error) {
 	return startedAt, nil
 }
 
-func (a *App) persistMarketPrice(ctx context.Context, symbol string, price float64) (time.Time, error) {
-	return a.persistObservedMarketPrice(ctx, symbol, price, time.Time{})
-}
-
 func (a *App) persistObservedMarketPrice(ctx context.Context, symbol string, price float64, startedAt time.Time) (time.Time, error) {
 	if !isValidMarketPrice(price) {
 		return time.Time{}, errors.New("cannot persist invalid market price")
